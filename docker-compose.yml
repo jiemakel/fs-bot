@@ -1,0 +1,54 @@
+services:
+  playtime-bot:
+    environment:
+      SIGNAL_SERVICE: ${SIGNAL_SERVICE}
+      PHONE_NUMBER: ${PHONE_NUMBER}
+      SIGNAL_GROUP_ID: ${SIGNAL_GROUP_ID}
+
+      ADMIN_1_PHONE: ${ADMIN_1_PHONE}
+      ADMIN_2_PHONE: ${ADMIN_2_PHONE}
+
+      CHILD_1_PHONE: ${CHILD_1_PHONE}
+      CHILD_1_MS_ID: ${CHILD_1_MS_ID}
+      CHILD_1_NAME: ${CHILD_1_NAME}
+      CHILD_2_PHONE: ${CHILD_2_PHONE}
+      CHILD_2_MS_ID: ${CHILD_2_MS_ID}
+      CHILD_2_NAME: ${CHILD_2_NAME}
+
+      MS_FAMILY_EMAIL: ${MS_FAMILY_EMAIL}
+      MS_FAMILY_PASSWORD: ${MS_FAMILY_PASSWORD}
+
+      WEEKLY_ADDITION_TIME: ${WEEKLY_ADDITION_TIME}
+      MAX_BANK_TIME: ${MAX_BANK_TIME}
+      BREAK_BALANCE_MAX_TIME: ${BREAK_BALANCE_MAX_TIME}
+      BREAK_RECOVERY_RATE: ${BREAK_RECOVERY_RATE}
+
+      BLACKOUT_PERIOD_MON: ${BLACKOUT_PERIOD_MON}
+      BLACKOUT_PERIOD_TUE: ${BLACKOUT_PERIOD_TUE}
+      BLACKOUT_PERIOD_WED: ${BLACKOUT_PERIOD_WED}
+      BLACKOUT_PERIOD_THU: ${BLACKOUT_PERIOD_THU}
+      BLACKOUT_PERIOD_FRI: ${BLACKOUT_PERIOD_FRI}
+      BLACKOUT_PERIOD_SAT: ${BLACKOUT_PERIOD_SAT}
+      BLACKOUT_PERIOD_SUN: ${BLACKOUT_PERIOD_SUN}
+
+      TZ: ${TZ}
+      DATA_DIR: ${DATA_DIR}
+      BOT_LANGUAGE: ${BOT_LANGUAGE}
+    depends_on:
+      - signal-cli-rest-api
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  signal-cli-rest-api:
+    image: bbernhard/signal-cli-rest-api:latest
+    environment:
+      - MODE=native
+    ports:
+      - "8080:8080"
+    volumes:
+      - signal-cli-data:/home/.local/share/signal-cli
+    restart: unless-stopped
+
+volumes:
+  signal-cli-data:

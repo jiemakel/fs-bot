@@ -1,0 +1,24 @@
+[project]
+name = "playtime-bot"
+version = "0.1.0"
+description = "Signal bot that manages playtime requests with Microsoft Family Safety integration"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+	"httpx",
+	"signalbot",
+	"python-dateutil",
+]
+
+[project.optional-dependencies]
+dev = [
+	"pytest",
+]
+
+[project.scripts]
+playtime-bot = "main:main"
+
+[tool.pytest.ini_options]
+markers = [
+	"live: tests that would hit real APIs; opt-in with LIVE_TEST=1",
+]

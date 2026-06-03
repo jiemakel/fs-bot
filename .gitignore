@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Pytest
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# IDE history
+.history
+
+# Runtime data
+data/*.sqlite3
+data/*.sqlite3-*
+data/signal-cli/
+.env
