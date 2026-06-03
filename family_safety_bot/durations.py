@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 
 _DURATION_TOKEN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(h|min|m)")
-_DURATION_MULTIPLIER_RE = re.compile(r"^(\d+)\s*x\s*(.+)$")
+_DURATION_MULTIPLIER_RE = re.compile(r"^\+?(\d+)\s*x\s*(.+)$")
 
 
 def parse_duration_minutes(value: str) -> int | None:

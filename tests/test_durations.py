@@ -37,6 +37,10 @@ def test_parse_signed_duration_minutes_accepts_equals_prefix() -> None:
     assert parse_signed_duration_minutes("=2h") == 120
 
 
+def test_parse_duration_minutes_accepts_plus_prefixed_multiplier() -> None:
+    assert parse_duration_minutes("+3x45m") == 135
+
+
 def test_parse_duration_minutes_rejects_multiplier_without_duration() -> None:
     assert parse_duration_minutes("3x") is None
 
