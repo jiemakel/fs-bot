@@ -71,6 +71,7 @@
     "rules.status_recovery_rate": "ℹ️ Break balance recovers at {rate}x rate",
     "rules.status_recovery_needed": "   Full recovery needs: {minutes} of recovery time",
     "rules.status_recovery_needed_active": "   Full recovery would need (if recovery started now): {minutes}",
+    "rules.status_recovery_progress": "   Resting: {current}/{needed} (recovery granted only when complete)",
     "rules.add_to_bank": "✅ Added {actual_added} to bank. New bank: {bank}/{max_bank}.",
     "rules.set_bank": "✅ Set bank from {old_balance} to {new_balance}/{max_bank}.",
     "rules.set_bank_capped": " (Capped at max bank.)",

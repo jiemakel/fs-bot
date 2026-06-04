@@ -150,18 +150,30 @@ def test_playtime_rules_blackout_full_day_period(tmp_path: Path) -> None:
 
 
 def test_playtime_rules_break_balance_recovery(tmp_path: Path) -> None:
+    """Recovery is only granted at end of a full rest period (all-or-nothing)."""
     store = build_store(tmp_path)
-    settings = build_settings(tmp_path)
+    settings = build_settings(tmp_path)  # break_recovery_rate=3.0
     rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
 
     store.set_bank_balance(CHILD_PHONE, 300)
-    past_time = datetime.now(timezone.utc) - timedelta(minutes=20)
-    store.set_consumed_break_debt(CHILD_PHONE, 90, past_time)
 
-    _decision = rules.evaluate_request(60)
+    # 90 min debt requires 90/3 = 30 min rest.
+    base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
+    store.set_consumed_break_debt(CHILD_PHONE, 90, base)
 
-    balance, _ = store.get_consumed_break_debt(CHILD_PHONE)
-    assert balance <= 30
+    # After 20 min of rest (< 30 min needed): no recovery yet.
+    rules._get_local_now = lambda: base + timedelta(minutes=20)  # type: ignore[method-assign]
+    rules.evaluate_request(60)
+    balance, _, rest_acc = store.get_consumed_break_debt(CHILD_PHONE)
+    assert balance == 90
+    assert int(rest_acc) == 20
+
+    # After 30 min of rest (full period complete): debt cleared.
+    rules._get_local_now = lambda: base + timedelta(minutes=30)  # type: ignore[method-assign]
+    rules.evaluate_request(60)
+    balance, _, rest_acc = store.get_consumed_break_debt(CHILD_PHONE)
+    assert balance == 0
+    assert rest_acc == 0.0
 
 
 def test_playtime_rules_natural_session_end_starts_break_recovery(tmp_path: Path) -> None:
@@ -177,7 +189,7 @@ def test_playtime_rules_natural_session_end_starts_break_recovery(tmp_path: Path
     rules._get_local_now = lambda: now  # type: ignore[method-assign]
 
     assert rules.has_active_session() is False
-    balance, _ = store.get_consumed_break_debt(CHILD_PHONE)
+    balance, _, _rest = store.get_consumed_break_debt(CHILD_PHONE)
     assert balance == 0
 
 
@@ -235,7 +247,7 @@ def test_playtime_rules_status_active_recovery_uses_accrued_debt_only(tmp_path: 
     store.set_consumed_break_debt(CHILD_PHONE, 0, start)
 
     status = rules.get_status()
-    balance, _ = store.get_consumed_break_debt(CHILD_PHONE)
+    balance, _, _rest = store.get_consumed_break_debt(CHILD_PHONE)
     assert balance == 30
     assert status
 

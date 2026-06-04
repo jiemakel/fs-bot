@@ -29,6 +29,7 @@ class RuntimeState:
     bank_balance: int
     weekly_bank_baseline: int
     consumed_break_debt: int
+    rest_accumulated: float
     active_remaining: int
     active_session: ActiveSession | None
     effective_break_load: int
@@ -145,14 +146,16 @@ class PlaytimeRules:
 
         Break balance tracks consumed playtime debt:
         - increases during active playtime minutes
-        - decreases during non-playtime minutes at break_recovery_rate
+        - decreases only after a complete recovery period (rest_accumulated >= debt / break_recovery_rate)
+        - any new play resets the rest accumulation counter
         """
-        consumed_break_debt, last_update = self._store.get_consumed_break_debt(self._child_id)
+        consumed_break_debt, last_update, rest_accumulated = self._store.get_consumed_break_debt(self._child_id)
         time_passed = (now - last_update).total_seconds() / 60  # minutes
         if time_passed <= 0:
             return  # No time has passed
 
         play_minutes = 0.0
+        play_end = last_update
         active = self._store.get_active_session(self._child_id)
         if active:
             session_id, start_time, minutes_granted = active
@@ -164,14 +167,29 @@ class PlaytimeRules:
 
             # Count only the overlap between [last_update, now] and the session interval.
             play_start = max(last_update, start_time)
-            play_end = min(now, session_end)
-            if play_end > play_start:
-                play_minutes = (play_end - play_start).total_seconds() / 60
+            play_end_time = min(now, session_end)
+            if play_end_time > play_start:
+                play_minutes = (play_end_time - play_start).total_seconds() / 60
+                play_end = play_end_time
 
-        non_play_minutes = max(0.0, time_passed - play_minutes)
-        recovery = non_play_minutes * profile.break_recovery_rate
-        new_consumed_break_debt = max(0, consumed_break_debt + play_minutes - recovery)
-        self._store.set_consumed_break_debt(self._child_id, int(new_consumed_break_debt), now)
+        if play_minutes > 0:
+            # Play occurred: add debt and reset rest accumulation.
+            # Any rest after the session ended starts a fresh accumulation period.
+            new_debt = consumed_break_debt + play_minutes
+            new_rest_accumulated = (now - play_end).total_seconds() / 60 if play_end < now else 0.0
+        else:
+            non_play_minutes = max(0.0, time_passed - play_minutes)
+            new_debt = float(consumed_break_debt)
+            new_rest_accumulated = rest_accumulated + non_play_minutes
+
+        # Recovery is only granted when a full rest period is completed.
+        if new_debt > 0:
+            recovery_needed = new_debt / profile.break_recovery_rate
+            if new_rest_accumulated >= recovery_needed:
+                new_debt = 0.0
+                new_rest_accumulated = 0.0
+
+        self._store.set_consumed_break_debt(self._child_id, int(new_debt), now, new_rest_accumulated)
 
     def _is_in_blackout_period(self, dt: datetime, profile: RuleProfile | None = None) -> tuple[bool, str]:
         """Check if given time is in a blackout period.
@@ -353,11 +371,12 @@ class PlaytimeRules:
             active_remaining = 0
         bank_balance = self._store.get_bank_balance(self._child_id)
         weekly_bank_baseline = self._weekly_bank_baseline(now, bank_balance)
-        consumed_break_debt, _ = self._store.get_consumed_break_debt(self._child_id)
+        consumed_break_debt, _, rest_accumulated = self._store.get_consumed_break_debt(self._child_id)
         return RuntimeState(
             bank_balance=bank_balance,
             weekly_bank_baseline=weekly_bank_baseline,
             consumed_break_debt=consumed_break_debt,
+            rest_accumulated=rest_accumulated,
             active_remaining=active_remaining,
             active_session=active,
             effective_break_load=self._effective_break_load(consumed_break_debt, active_remaining),
@@ -693,6 +712,14 @@ class PlaytimeRules:
                 )
             else:
                 lines.append(self._i18n.msg("rules.status_recovery_needed", minutes=format_duration(recovery_time)))
+                if state.rest_accumulated > 0:
+                    lines.append(
+                        self._i18n.msg(
+                            "rules.status_recovery_progress",
+                            current=format_duration(int(state.rest_accumulated)),
+                            needed=format_duration(recovery_time),
+                        )
+                    )
             lines.append("")
         
         return "\n".join(lines)
@@ -752,8 +779,8 @@ class PlaytimeRules:
         """Set consumed break debt to an explicit value in minutes (admin function)."""
         profile = self._profile()
         capped_minutes = min(minutes, profile.break_balance_max_minutes)
-        old_balance, _ = self._store.get_consumed_break_debt(self._child_id)
-        self._store.set_consumed_break_debt(self._child_id, capped_minutes, self._get_local_now())
+        old_balance, _, _rest = self._store.get_consumed_break_debt(self._child_id)
+        self._store.set_consumed_break_debt(self._child_id, capped_minutes, self._get_local_now(), 0.0)
 
         message = self._i18n.msg(
             "rules.set_break_balance",

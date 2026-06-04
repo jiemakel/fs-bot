@@ -56,10 +56,18 @@ class PlaytimeStore:
             CREATE TABLE IF NOT EXISTS break_balance (
                 child_id TEXT PRIMARY KEY,
                 balance_minutes INTEGER NOT NULL DEFAULT 0,
-                last_update_iso TEXT NOT NULL
+                last_update_iso TEXT NOT NULL,
+                rest_accumulated_minutes REAL NOT NULL DEFAULT 0.0
             );
             """
         )
+        # Migration: add rest_accumulated_minutes to existing tables
+        try:
+            conn.execute(
+                "ALTER TABLE break_balance ADD COLUMN rest_accumulated_minutes REAL NOT NULL DEFAULT 0.0"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         
         # Session tracking per child
         conn.execute(
@@ -273,28 +281,28 @@ class PlaytimeStore:
         self.set_weekly_bank_baseline(child_id, week_start_iso, new_baseline)
         return new_baseline
 
-    def get_consumed_break_debt(self, child_id: str) -> tuple[int, datetime]:
-        """Get (consumed_break_debt_minutes, last_update_time) for a child."""
+    def get_consumed_break_debt(self, child_id: str) -> tuple[int, datetime, float]:
+        """Get (consumed_break_debt_minutes, last_update_time, rest_accumulated_minutes) for a child."""
         with sqlite3.connect(self._db_path) as conn:
             self._ensure_child_in_conn(conn, child_id)
             row = conn.execute(
-                "SELECT balance_minutes, last_update_iso FROM break_balance WHERE child_id = ?;",
+                "SELECT balance_minutes, last_update_iso, rest_accumulated_minutes FROM break_balance WHERE child_id = ?;",
                 (child_id,),
             ).fetchone()
             assert row is not None
-            return (row[0], _parse_stored_datetime(row[1]))
+            return (row[0], _parse_stored_datetime(row[1]), row[2])
 
-    def set_consumed_break_debt(self, child_id: str, debt_minutes: int, update_time: datetime) -> None:
+    def set_consumed_break_debt(self, child_id: str, debt_minutes: int, update_time: datetime, rest_accumulated_minutes: float = 0.0) -> None:
         """Set consumed break debt and last update time for a child."""
         with sqlite3.connect(self._db_path) as conn:
             self._ensure_child_in_conn(conn, child_id)
             conn.execute(
                 """
                 UPDATE break_balance 
-                SET balance_minutes = ?, last_update_iso = ? 
+                SET balance_minutes = ?, last_update_iso = ?, rest_accumulated_minutes = ?
                 WHERE child_id = ?;
                 """,
-                (max(0, debt_minutes), update_time.isoformat(), child_id),
+                (max(0, debt_minutes), update_time.isoformat(), max(0.0, rest_accumulated_minutes), child_id),
             )
             conn.commit()
 

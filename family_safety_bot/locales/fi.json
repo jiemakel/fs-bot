@@ -71,6 +71,7 @@
     "rules.status_recovery_rate": "ℹ️ Taukosaldo palautuu nopeudella {rate}x",
     "rules.status_recovery_needed": "   Täysi palautuminen vaatii: {minutes} palautumisaikaa",
     "rules.status_recovery_needed_active": "   Täysi palautuminen vaatisi (jos palautuminen alkaisi nyt): {minutes}",
+    "rules.status_recovery_progress": "   Tauko: {current}/{needed} (palautuminen myönnetään vasta kun jakso on valmis)",
     "rules.add_to_bank": "✅ Lisätty {actual_added} pankkiin. Uusi pankki: {bank}/{max_bank}.",
     "rules.set_bank": "✅ Pankki asetettu arvosta {old_balance} arvoon {new_balance}/{max_bank}.",
     "rules.set_bank_capped": " (Rajattu pankin maksimiin.)",
