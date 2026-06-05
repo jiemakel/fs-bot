@@ -46,19 +46,19 @@ def test_parse_duration_minutes_rejects_multiplier_without_duration() -> None:
 
 
 def test_parse_activity_claim_basic() -> None:
-    assert parse_activity_claim("30m played games") == (30, "played games")
+    assert parse_activity_claim("30m played games") == 30
 
 
 def test_parse_activity_claim_compound_duration() -> None:
-    assert parse_activity_claim("1h30m cleaned room") == (90, "cleaned room")
+    assert parse_activity_claim("1h30m cleaned room") == 90
 
 
 def test_parse_activity_claim_spaced_compound_duration() -> None:
-    assert parse_activity_claim("1h 30m read a book") == (90, "read a book")
+    assert parse_activity_claim("1h 30m read a book") == 90
 
 
 def test_parse_activity_claim_multiplier_duration() -> None:
-    assert parse_activity_claim("3x1h played games") == (180, "played games")
+    assert parse_activity_claim("3x1h played games") == 180
 
 
 def test_parse_activity_claim_no_description_returns_none() -> None:
@@ -74,7 +74,4 @@ def test_parse_activity_claim_plain_duration_with_trailing_space_returns_none() 
 
 
 def test_parse_activity_claim_multiword_description() -> None:
-    assert parse_activity_claim("45m cleaned my room and did homework") == (
-        45,
-        "cleaned my room and did homework",
-    )
+    assert parse_activity_claim("45m cleaned my room and did homework") == 45

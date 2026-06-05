@@ -43,34 +43,26 @@ def parse_duration_minutes(value: str) -> int | None:
     return int(round(total_minutes * multiplier))
 
 
-def parse_activity_claim(text: str) -> tuple[int, str] | None:
-    """Parse '<duration> <description>' from text.
+def parse_activity_claim(text: str) -> int | None:
+    """Validate and parse an activity claim (duration + non-empty description).
 
-    Finds the longest valid duration prefix (> 0 min) that still leaves a
-    non-empty description.  Returns ``(minutes, description)`` on success, or
-    ``None`` if no valid claim pattern is found.
+    Returns the parsed minutes if ``text`` starts with a valid positive duration
+    followed by at least one more word, or ``None`` otherwise.  The caller is
+    responsible for storing the original ``text`` as the claim description.
     """
     tokens = text.strip().split()
     if len(tokens) < 2:
         return None
 
     best_minutes: int | None = None
-    best_desc_start: int | None = None
 
     for split_at in range(1, len(tokens)):
         candidate = " ".join(tokens[:split_at])
         minutes = parse_duration_minutes(candidate)
         if minutes is not None and minutes > 0:
             best_minutes = minutes
-            best_desc_start = split_at
 
-    if best_minutes is None or best_desc_start is None:
-        return None
-
-    description = " ".join(tokens[best_desc_start:]).strip()
-    if not description:
-        return None
-    return (best_minutes, description)
+    return best_minutes
 
 
 def parse_signed_duration_minutes(value: str) -> int | None:

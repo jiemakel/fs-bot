@@ -38,7 +38,7 @@
     "watcher.claim_received": "📋 [{sender_name}] Claim recorded: {minutes} for \"{description}\"",
     "watcher.no_pending_claims": "✅ No pending claims for {child_name}.",
     "watcher.claims_header": "📋 Pending claims for {child_name} ({count}):",
-    "watcher.claims_entry": "  • {minutes} – {description} (submitted {submitted_at})",
+    "watcher.claims_entry": "  • {description} (submitted {submitted_at})",
     "watcher.claims_total": "  Total: {total}",
     "watcher.claims_auto_handled_header": "📋 Auto-resolved {count} pending claim(s):",
     "watcher.ack_header": "📋 Acknowledging {count} claim(s) (total: {total}):",

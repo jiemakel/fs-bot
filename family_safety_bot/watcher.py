@@ -559,10 +559,9 @@ class PlaytimeManager(Command):
             return
 
         if is_child and rules is not None:
-            claim = parse_activity_claim(message_text)
-            if claim is not None:
-                claim_minutes, description = claim
-                await self.claim_command(ctx, child, claim_minutes, description, sender_name)
+            claim_minutes = parse_activity_claim(message_text)
+            if claim_minutes is not None:
+                await self.claim_command(ctx, child, claim_minutes, message_text, sender_name)
                 return
 
         if is_child and NUMERIC_ONLY_RE.match(message_text):
@@ -794,7 +793,6 @@ class PlaytimeManager(Command):
             lines.append(
                 self._i18n.msg(
                     "watcher.claims_entry",
-                    minutes=format_duration(c.claimed_minutes),
                     description=c.description,
                     submitted_at=submitted,
                 )

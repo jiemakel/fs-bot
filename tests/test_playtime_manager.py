@@ -339,14 +339,14 @@ def test_child_activity_claim_stored_and_bank_unchanged(tmp_path: Path) -> None:
     claims = store.get_pending_claims(CHILD_PHONE)
     assert len(claims) == 1
     assert claims[0].claimed_minutes == 30
-    assert claims[0].description == "played guitar"
+    assert claims[0].description == "30m played guitar"
 
 
 def test_admin_claims_lists_pending(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
     from datetime import datetime, timezone
-    store.add_activity_claim(CHILD_PHONE, 30, "played guitar", datetime.now(timezone.utc))
-    store.add_activity_claim(CHILD_PHONE, 60, "cleaned room", datetime.now(timezone.utc))
+    store.add_activity_claim(CHILD_PHONE, 30, "30m played guitar", datetime.now(timezone.utc))
+    store.add_activity_claim(CHILD_PHONE, 60, "1h cleaned room", datetime.now(timezone.utc))
 
     ctx = FakeContext(message_text="claims", sender=ADMIN_PHONE, sent_messages=[])
     _run_handle(manager, ctx)
@@ -361,8 +361,8 @@ def test_admin_ack_grants_total_and_clears_claims(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
     store.set_bank_balance(CHILD_PHONE, 60)
     from datetime import datetime, timezone
-    store.add_activity_claim(CHILD_PHONE, 30, "played guitar", datetime.now(timezone.utc))
-    store.add_activity_claim(CHILD_PHONE, 60, "cleaned room", datetime.now(timezone.utc))
+    store.add_activity_claim(CHILD_PHONE, 30, "30m played guitar", datetime.now(timezone.utc))
+    store.add_activity_claim(CHILD_PHONE, 60, "1h cleaned room", datetime.now(timezone.utc))
 
     ctx = FakeContext(message_text="ack", sender=ADMIN_PHONE, sent_messages=[])
     _run_handle(manager, ctx)
@@ -386,7 +386,7 @@ def test_admin_bank_modification_auto_handles_pending_claims(tmp_path: Path) -> 
     manager, store = _build_manager(tmp_path)
     store.set_bank_balance(CHILD_PHONE, 60)
     from datetime import datetime, timezone
-    store.add_activity_claim(CHILD_PHONE, 30, "played guitar", datetime.now(timezone.utc))
+    store.add_activity_claim(CHILD_PHONE, 30, "30m played guitar", datetime.now(timezone.utc))
 
     ctx = FakeContext(message_text="TestChild 1h", sender=ADMIN_PHONE, sent_messages=[])
     _run_handle(manager, ctx)
