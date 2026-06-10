@@ -561,6 +561,17 @@ class PlaytimeRules:
         self._store.set_bank_balance(self._child_id, new_bank)
         consumed_break_debt = state.consumed_break_debt
 
+        # Detect recovery abort: starting a NEW session while mid-recovery.
+        recovery_aborted = (
+            not state.active_session
+            and state.consumed_break_debt > 0
+            and state.rest_accumulated > 0
+        )
+        if recovery_aborted:
+            self._store.set_recovery_abort(self._child_id, state.rest_accumulated, now)
+        else:
+            self._store.clear_recovery_abort(self._child_id)
+
         if state.active_session:
             session_id, _start_time, current_granted = state.active_session
             new_total_granted = current_granted + additional_minutes
@@ -585,6 +596,15 @@ class PlaytimeRules:
                 ),
             ]
         )
+        if recovery_aborted:
+            recovery_needed = self._recovery_minutes(consumed_break_debt, profile)
+            lines.append(
+                self._i18n.msg(
+                    "rules.recovery_aborted_warning",
+                    rest_done=format_duration(int(state.rest_accumulated)),
+                    rest_needed=format_duration(recovery_needed),
+                )
+            )
 
         return (session_id, "\n".join(lines))
 
@@ -618,10 +638,28 @@ class PlaytimeRules:
         
         # Mark session complete
         self._store.complete_session(session_id, now)
+
+        # Check if this stop is within the 1-minute grace window after a recovery abort.
+        recovery_restored = False
+        abort = self._store.get_recovery_abort(self._child_id)
+        if abort is not None:
+            saved_rest, abort_time = abort
+            seconds_since_abort = (now - abort_time).total_seconds()
+            if 0 <= seconds_since_abort <= 60:
+                # Restore saved rest_accumulated so recovery continues as if uninterrupted.
+                current_debt, _, _ = self._store.get_consumed_break_debt(self._child_id)
+                self._store.set_consumed_break_debt(self._child_id, current_debt, now, saved_rest)
+                recovery_restored = True
+            self._store.clear_recovery_abort(self._child_id)
         
         message = self._i18n.msg("rules.session_completed", minutes=format_duration(actual_minutes))
         if ended_early:
             message += self._i18n.msg("rules.session_completed_credited", minutes=format_duration(unused))
+        if recovery_restored:
+            message += "\n" + self._i18n.msg(
+                "rules.recovery_restored",
+                rest_done=format_duration(int(saved_rest)),
+            )
         
         return message
 

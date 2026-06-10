@@ -60,6 +60,8 @@
     "rules.no_active_session": "No active session to complete.",
     "rules.session_completed": "✅ Session completed. Played {minutes}.",
     "rules.session_completed_credited": " ({minutes} credited back to bank)",
+    "rules.recovery_aborted_warning": "⚠️ Recovery interrupted! You had rested {rest_done} of {rest_needed} needed. Stop within 1 minute to continue where you left off.",
+    "rules.recovery_restored": "✅ Recovery resumed: {rest_done} of rest preserved.",
     "rules.status_title": "📊 Playtime Status",
     "rules.status_bank_avg_pace": "Bank: {avg_per_day}/day until next week, playtime left {playtime_share} per {non_blackout_share} of week (ratio {pace_ratio})",
     "rules.status_bank_total_max": "Bank total: {total} (max {max_balance})",

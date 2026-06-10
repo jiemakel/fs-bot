@@ -176,6 +176,76 @@ def test_playtime_rules_break_balance_recovery(tmp_path: Path) -> None:
     assert rest_acc == 0.0
 
 
+def test_playtime_rules_recovery_abort_can_be_resumed_by_quick_stop(tmp_path: Path) -> None:
+    store = build_store(tmp_path)
+    settings = build_settings(tmp_path, break_recovery_rate=3.0)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+
+    base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
+    grant_at = base + timedelta(minutes=20)
+    stop_at = grant_at + timedelta(seconds=30)
+    store.set_bank_balance(CHILD_PHONE, 300)
+    store.set_consumed_break_debt(CHILD_PHONE, 90, base)
+
+    rules._get_local_now = lambda: grant_at  # type: ignore[method-assign]
+    session_id, grant_message = rules.grant_playtime(10)
+
+    assert session_id > 0
+    assert "Recovery interrupted" in grant_message
+    assert "20m" in grant_message
+    assert "30m" in grant_message
+    abort = store.get_recovery_abort(CHILD_PHONE)
+    assert abort is not None
+    saved_rest, abort_time = abort
+    assert int(saved_rest) == 20
+    assert abort_time == grant_at
+
+    rules._get_local_now = lambda: stop_at  # type: ignore[method-assign]
+    complete_message = rules.complete_session()
+
+    assert "Recovery resumed" in complete_message
+    assert "20m" in complete_message
+    assert store.get_recovery_abort(CHILD_PHONE) is None
+    balance, last_update, rest_acc = store.get_consumed_break_debt(CHILD_PHONE)
+    assert balance == 90
+    assert last_update == stop_at
+    assert int(rest_acc) == 20
+
+    rules._get_local_now = lambda: stop_at + timedelta(minutes=10)  # type: ignore[method-assign]
+    rules.evaluate_request(1)
+
+    balance, _, rest_acc = store.get_consumed_break_debt(CHILD_PHONE)
+    assert balance == 0
+    assert rest_acc == 0.0
+
+
+def test_playtime_rules_recovery_abort_expired_grace_does_not_restore_rest(tmp_path: Path) -> None:
+    store = build_store(tmp_path)
+    settings = build_settings(tmp_path, break_recovery_rate=3.0)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+
+    base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
+    grant_at = base + timedelta(minutes=20)
+    stop_at = grant_at + timedelta(minutes=2)
+    store.set_bank_balance(CHILD_PHONE, 300)
+    store.set_consumed_break_debt(CHILD_PHONE, 90, base)
+
+    rules._get_local_now = lambda: grant_at  # type: ignore[method-assign]
+    _session_id, grant_message = rules.grant_playtime(10)
+    assert "Recovery interrupted" in grant_message
+    assert store.get_recovery_abort(CHILD_PHONE) is not None
+
+    rules._get_local_now = lambda: stop_at  # type: ignore[method-assign]
+    complete_message = rules.complete_session()
+
+    assert "Recovery resumed" not in complete_message
+    assert store.get_recovery_abort(CHILD_PHONE) is None
+    balance, last_update, rest_acc = store.get_consumed_break_debt(CHILD_PHONE)
+    assert balance == 92
+    assert last_update == stop_at
+    assert rest_acc == 0.0
+
+
 def test_playtime_rules_natural_session_end_starts_break_recovery(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path)

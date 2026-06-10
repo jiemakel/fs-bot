@@ -60,6 +60,8 @@
     "rules.no_active_session": "Ei aktiivista sessiota päätettäväksi.",
     "rules.session_completed": "✅ Sessio päätetty. Pelattu {minutes}.",
     "rules.session_completed_credited": " ({minutes} hyvitetty takaisin pankkiin)",
+    "rules.recovery_aborted_warning": "⚠️ Palautuminen keskeytyi! Olit levännyt {rest_done}/{rest_needed} tarvittavasta. Pysäytä sessio 1 minuutin sisällä jatkaaksesi siitä mihin jäit.",
+    "rules.recovery_restored": "✅ Palautuminen jatkuu: {rest_done} lepoaika säilytetty.",
     "rules.status_title": "📊 Peliaikatilanne",
     "rules.status_bank_avg_pace": "Pankki: {avg_per_day}/päivä ensi viikkoon asti, viikkopeliajasta jäljellä {playtime_share}, viikosta jäljellä {non_blackout_share} (suhdeluku {pace_ratio})",
     "rules.status_bank_total_max": "Pankki yhteensä: {total} (maksimi {max_balance})",

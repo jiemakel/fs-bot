@@ -426,6 +426,29 @@ class PlaytimeStore:
     def is_child_block_mode_enabled(self, child_id: str) -> bool:
         return self._get_app_state(f"grant_block_mode:{child_id}") == "1"
 
+    def set_recovery_abort(self, child_id: str, saved_rest: float, abort_time: datetime) -> None:
+        """Record that recovery was aborted mid-period."""
+        self._set_app_state(f"recovery_abort:{child_id}", f"{saved_rest}|{abort_time.isoformat()}")
+
+    def get_recovery_abort(self, child_id: str) -> tuple[float, datetime] | None:
+        """Return (saved_rest, abort_time) if a recovery abort is recorded, else None."""
+        raw = self._get_app_state(f"recovery_abort:{child_id}")
+        if not raw:
+            return None
+        parts = raw.split("|", 1)
+        if len(parts) != 2:
+            return None
+        try:
+            saved_rest = float(parts[0])
+            abort_time = _parse_stored_datetime(parts[1])
+        except (ValueError, TypeError):
+            return None
+        return (saved_rest, abort_time)
+
+    def clear_recovery_abort(self, child_id: str) -> None:
+        """Remove any recorded recovery abort for a child."""
+        self._set_app_state(f"recovery_abort:{child_id}", "")
+
     def add_activity_claim(
         self,
         child_id: str,
