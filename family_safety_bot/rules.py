@@ -801,23 +801,6 @@ class PlaytimeRules:
         current_balance = self._store.get_bank_balance(self._child_id)
         return self.set_bank(current_balance + delta_minutes)
 
-    def set_accrued_playtime(self, minutes: int) -> str:
-        """Accrued playtime to an explicit value in minutes (admin function)."""
-        profile = self._profile()
-        capped_minutes = min(minutes, profile.accrued_playtime_max_minutes)
-        old_balance, _, _rest = self._store.get_accrued_playtime(self._child_id)
-        self._store.set_accrued_playtime(self._child_id, capped_minutes, self._get_local_now(), 0.0)
-
-        message = self._i18n.msg(
-            "rules.set_accrued_playtime",
-            old_balance=format_duration(old_balance),
-            new_balance=format_duration(capped_minutes),
-            max_balance=format_duration(profile.accrued_playtime_max_minutes),
-        )
-        if capped_minutes != minutes:
-            message += self._i18n.msg("rules.set_accrued_playtime_capped")
-        return message
-
     def rollover_week(self) -> str:
         """Handle weekly rollover: add weekly allowance to bank (up to limit)."""
         now = self._get_local_now()

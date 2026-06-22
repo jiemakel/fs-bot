@@ -5,7 +5,6 @@
     "end": ["end", "stop", "complete"],
     "admin_test": ["request"],
     "admin_end": ["end", "stop", "complete"],
-    "admin_setbreak": ["break"],
     "admin_rollover": ["week", "rollover"],
     "admin_block": ["block"],
     "admin_unblock": ["unblock"],
@@ -52,7 +51,7 @@
     "watcher.profile_summary": "Profile: {name}\n  weekly_addition: {weekly_addition}\n  max_bank: {max_bank}\n  accrued_playtime_max: {accrued_max}\n  break_recovery_rate: {break_recovery_rate}\n  blackouts:\n{blackouts}",
     "watcher.profile_summary_blackout_day": "  {day}: {periods}",
     "watcher.profile_summary_no_blackouts": "none",
-    "watcher.help_admin": "🤖 Playtime Bot - Admin Commands\n\nSTATUS:\n  • status - Show playtime status for all children\n  • request [name] <duration> - Test request flow\n\nMANAGEMENT:\n  • [name] <duration> - Add time to bank\n  • [name] +<duration> - Add time to bank explicitly\n  • [name] -<duration> - Remove time from bank\n  • [name] =<duration> - Set bank to exact value\n  • break [name] <duration> - Set accrued playtime to exact value\n  • end [name] - End active session\n  • rollover [name] - Force weekly rollover\n  • block [name] - Enable grant block mode (ends active session)\n  • unblock [name] - Disable grant block mode\n\nACTIVITY CLAIMS:\n  • claims [name] - List pending activity claims\n  • ack [name] - Grant all pending activity claims to bank\n\nPROFILES:\n  • profile list - List available rule profiles\n  • profile show <name> - Show profile settings\n  • profile define <name> KEY=VALUE ... - Create or replace profile using env-style settings\n  • profile use <name> <child> - Assign a profile to a child\n    required keys: WEEKLY_ADDITION_TIME, MAX_BANK_TIME, ACCRUED_PLAYTIME_MAX_TIME, BREAK_RECOVERY_RATE, BLACKOUT_PERIOD_MON..BLACKOUT_PERIOD_SUN\n\nDuration must include unit: h, m, or min (examples: 1h, 30m, 30min, 1.5h, 3x1h15m)\nNote: [name] is optional; omitting it applies the command to all children. Child names are case-insensitive.\n",
+    "watcher.help_admin": "🤖 Playtime Bot - Admin Commands\n\nSTATUS:\n  • status - Show playtime status for all children\n  • request [name] <duration> - Test request flow\n\nMANAGEMENT:\n  • [name] <duration> - Add time to bank\n  • [name] +<duration> - Add time to bank explicitly\n  • [name] -<duration> - Remove time from bank\n  • [name] =<duration> - Set bank to exact value\n  • end [name] - End active session\n  • rollover [name] - Force weekly rollover\n  • block [name] - Enable grant block mode (ends active session)\n  • unblock [name] - Disable grant block mode\n\nACTIVITY CLAIMS:\n  • claims [name] - List pending activity claims\n  • ack [name] - Grant all pending activity claims to bank\n\nPROFILES:\n  • profile list - List available rule profiles\n  • profile show <name> - Show profile settings\n  • profile define <name> KEY=VALUE ... - Create or replace profile using env-style settings\n  • profile use <name> <child> - Assign a profile to a child\n    required keys: WEEKLY_ADDITION_TIME, MAX_BANK_TIME, ACCRUED_PLAYTIME_MAX_TIME, BREAK_RECOVERY_RATE, BLACKOUT_PERIOD_MON..BLACKOUT_PERIOD_SUN\n\nDuration must include unit: h, m, or min (examples: 1h, 30m, 30min, 1.5h, 3x1h15m)\nNote: [name] is optional; omitting it applies the command to all children. Child names are case-insensitive.\n",
     "watcher.help_child": "🤖 Playtime Bot\n\nCOMMANDS:\n  • <duration> - Request playtime (must include h, m, or min)\n  • <duration> <activity> - Submit an activity claim for extra playtime\n  • status - See playtime status for everyone\n  • end - End your active session early\n\nEXAMPLES:\n  • 30m - Request 30 minutes\n  • 1.5h - Request 1 hour 30 minutes\n  • 30m cleaned my room - Claim 30 minutes for cleaning your room\n",
     "rules.blackout_denied": "Playtime not allowed during {start_time}-{end_time}",
     "rules.recovery_maxed_denied": "Accrued playtime maxed out ({accrued_playtime}). Need at least {recovery_time} of break time before playing again.",
@@ -88,8 +87,6 @@
     "rules.add_to_bank": "✅ Added {actual_added} to bank. New bank: {bank}/{max_bank}.",
     "rules.set_bank": "✅ Set bank from {old_balance} to {new_balance}/{max_bank}.",
     "rules.set_bank_capped": " (Capped at max bank.)",
-    "rules.set_accrued_playtime": "✅ Set accrued playtime from {old_balance} to {new_balance}/{max_balance}.",
-    "rules.set_accrued_playtime_capped": " (Capped at max accrued playtime.)",
     "rules.rollover_week": "🔄 New week begun. Added {actual_added} to bank (max {max_bank}). New bank: {new_bank}."
   }
 }

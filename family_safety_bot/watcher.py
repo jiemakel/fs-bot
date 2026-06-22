@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 import shlex
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Awaitable, Callable
 
 import httpx
@@ -37,7 +37,6 @@ _COMMAND_KEYS = (
     "end",
     "admin_test",
     "admin_end",
-    "admin_setbreak",
     "admin_rollover",
     "admin_block",
     "admin_unblock",
@@ -81,7 +80,6 @@ class PlaytimeManager(Command):
             "admin_unblock": self._handle_admin_unblock_command,
             "admin_test": self._handle_admin_test_command,
             "admin_end": self._handle_admin_end_command,
-            "admin_setbreak": self._handle_admin_setbreak_command,
             "admin_rollover": self._handle_admin_rollover_command,
             "admin_profile": self._handle_admin_profile_command,
             "admin_claims": self._handle_admin_claims_command,
@@ -457,10 +455,6 @@ class PlaytimeManager(Command):
     async def _handle_admin_end_command(self, ctx: Context, payload: str) -> bool:
         return await self._run_for_resolved_children(ctx, payload, lambda c, r: self.admin_end_session_command(ctx, c, r))
 
-    async def _handle_admin_setbreak_command(self, ctx: Context, payload: str) -> bool:
-        async def action(child: Child, rules: PlaytimeRules, minutes: int, _is_relative: bool) -> None:
-            await self._send_admin_result(ctx, child, rules.set_accrued_playtime(minutes))
-        return await self._run_for_resolved_children_and_minutes(ctx, payload, parse_duration_minutes, action)
 
     async def _handle_admin_rollover_command(self, ctx: Context, payload: str) -> bool:
         async def action(child: Child, rules: PlaytimeRules) -> None:
@@ -774,11 +768,34 @@ class PlaytimeManager(Command):
             logger.exception("Failed to send rollover notification to group")
 
     async def _check_recovery_completion(self) -> None:
-        """Scheduled task to notify when accrued playtime recovery finishes."""
+        """Scheduled task to notify when accrued playtime recovery finishes or playtime finishes naturally."""
         results = []
         for phone, child in self._settings.children.items():
-            if message := self._rules_by_child[phone].check_recovery_completion():
-                results.append(f"[{child.name}]\n{message}")
+            rules = self._rules_by_child[phone]
+            local_now = rules._get_local_now()
+            
+            # Check if active session has expired naturally
+            active = self._store.get_active_session(child.phone_number)
+            session_finished_message = None
+            if active:
+                session_id, start_time, minutes_granted = active
+                session_end = start_time + timedelta(minutes=minutes_granted)
+                if local_now >= session_end:
+                    session_finished_message = self._i18n.msg(
+                        "rules.session_completed",
+                        minutes=format_duration(minutes_granted),
+                    )
+            
+            recovery_message = rules.check_recovery_completion()
+            
+            child_msgs = []
+            if session_finished_message:
+                child_msgs.append(session_finished_message)
+            if recovery_message:
+                child_msgs.append(recovery_message)
+                
+            if child_msgs:
+                results.append(f"[{child.name}]\n" + "\n".join(child_msgs))
 
         if not results:
             return
@@ -786,7 +803,7 @@ class PlaytimeManager(Command):
         try:
             await self.bot.send(self._settings.signal_group_id, "\n\n".join(results))  # type: ignore[union-attr]
         except Exception:
-            logger.exception("Failed to send recovery completion notification to group")
+            logger.exception("Failed to send scheduled notification to group")
 
     async def claim_command(
         self,

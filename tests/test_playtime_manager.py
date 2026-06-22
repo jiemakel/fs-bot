@@ -174,16 +174,32 @@ def test_playtime_manager_admin_bank_commands(
     assert store.get_bank_balance(CHILD_PHONE) == expected_balance
 
 
-def test_playtime_manager_admin_can_set_accrued_playtime(tmp_path: Path) -> None:
+def test_playtime_manager_natural_session_completion_notifies_group(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
-    now = manager._rules_by_child[CHILD_PHONE]._get_local_now()
-    store.set_accrued_playtime(CHILD_PHONE, 30, now)
+    rules = manager._rules_by_child[CHILD_PHONE]
+    base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
+    rules._get_local_now = lambda: base  # type: ignore[method-assign]
+    
+    store.set_accrued_playtime(CHILD_PHONE, 0, base)
+    store.add_session(CHILD_PHONE, base, 30)
+    
+    # Fast-forward 40 minutes (past session end)
+    rules._get_local_now = lambda: base + timedelta(minutes=40)  # type: ignore[method-assign]
+    
+    # Run status check scheduler task
+    asyncio.run(manager._check_recovery_completion())
+    
+    # We should have sent a notification to the group
+    bot = cast(FakeBot, manager.bot)
+    assert len(bot.sent) == 1
+    receiver, message = bot.sent[0]
+    assert receiver == manager._settings.signal_group_id
+    assert "TestChild" in message
+    assert "30m" in message
+    
+    # The session is now complete in the DB
+    assert store.get_active_session(CHILD_PHONE) is None
 
-    ctx = FakeContext(message_text="break TestChild 2h", sender=ADMIN_PHONE, sent_messages=[])
-    _run_handle(manager, ctx)
-
-    assert len(ctx.sent_messages) == 1
-    assert store.get_accrued_playtime(CHILD_PHONE)[0] == 120
 
 
 def test_playtime_manager_admin_can_toggle_grant_block_mode(tmp_path: Path) -> None:

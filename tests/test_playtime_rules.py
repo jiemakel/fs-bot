@@ -382,16 +382,3 @@ def test_playtime_rules_set_bank(tmp_path: Path) -> None:
     assert store.get_bank_balance(CHILD_PHONE) == 200
 
 
-def test_playtime_rules_set_accrued_playtime(tmp_path: Path) -> None:
-    store = build_store(tmp_path)
-    settings = build_settings(tmp_path, accrued_playtime_max_minutes=180)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
-
-    now = datetime.now(timezone.utc)
-    store.set_accrued_playtime(CHILD_PHONE, 30, now)
-
-    _result = rules.set_accrued_playtime(90)
-    assert store.get_accrued_playtime(CHILD_PHONE)[0] == 90
-
-    _result_capped = rules.set_accrued_playtime(999)
-    assert store.get_accrued_playtime(CHILD_PHONE)[0] == 180
