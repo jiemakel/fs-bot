@@ -112,33 +112,22 @@ class PlaytimeRules:
         now: datetime,
         profile: RuleProfile,
     ) -> tuple[int, float, float, float]:
-        playable_days_remaining, non_blackout_minutes_remaining = self._remaining_playable_window(now, profile)
-        if playable_days_remaining <= 0:
-            avg_minutes_per_day = 0
-        else:
-            avg_minutes_per_day = int(round(minutes / playable_days_remaining))
+        playable_days, non_blackout_remaining = self._remaining_playable_window(now, profile)
+        avg_per_day = int(round(minutes / playable_days)) if playable_days > 0 else 0
 
-        week_non_blackout_minutes = self._this_week_non_blackout_minutes(now, profile)
-        weekly_playtime_minutes = weekly_baseline_minutes
-        playtime_share = (minutes / weekly_playtime_minutes) if weekly_playtime_minutes > 0 else 0.0
-        non_blackout_share = (
-            non_blackout_minutes_remaining / week_non_blackout_minutes
-            if week_non_blackout_minutes > 0
-            else 0.0
-        )
+        week_non_blackout = self._this_week_non_blackout_minutes(now, profile)
+        playtime_share = (minutes / weekly_baseline_minutes) if weekly_baseline_minutes > 0 else 0.0
+        non_blackout_share = (non_blackout_remaining / week_non_blackout) if week_non_blackout > 0 else 0.0
         pace_ratio = (playtime_share / non_blackout_share) if non_blackout_share > 0 else 0.0
-        return avg_minutes_per_day, playtime_share, non_blackout_share, pace_ratio
+        return avg_per_day, playtime_share, non_blackout_share, pace_ratio
 
     def _bank_pace_line(self, minutes: int, weekly_baseline_minutes: int, now: datetime, profile: RuleProfile) -> str:
-        avg_minutes_per_day, playtime_share, non_blackout_share, pace_ratio = self._bank_pace_metrics(
-            minutes,
-            weekly_baseline_minutes,
-            now,
-            profile,
+        avg_per_day, playtime_share, non_blackout_share, pace_ratio = self._bank_pace_metrics(
+            minutes, weekly_baseline_minutes, now, profile
         )
         return self._i18n.msg(
             "rules.status_bank_avg_pace",
-            avg_per_day=format_duration(avg_minutes_per_day),
+            avg_per_day=format_duration(avg_per_day),
             playtime_share=f"{playtime_share * 100:.1f}%",
             non_blackout_share=f"{non_blackout_share * 100:.1f}%",
             pace_ratio=f"{pace_ratio:.2f}x",
@@ -200,55 +189,36 @@ class PlaytimeRules:
         return recovery_completion
 
     def _is_in_blackout_period(self, dt: datetime, profile: RuleProfile | None = None) -> tuple[bool, str]:
-        """Check if given time is in a blackout period.
-        
-        Returns (is_blackout, reason).
-        """
-        effective_profile = profile or self._profile()
-        weekday = dt.weekday()  # 0=Monday, 6=Sunday
-
-        # Check specific time periods
+        """Check if given time is in a blackout period. Returns (is_blackout, reason)."""
+        weekday = dt.weekday()
         current_minutes = dt.hour * 60 + dt.minute
-        for period_weekday, start_minutes, end_minutes, start_time, end_time in self._parsed_blackout_periods(effective_profile):
-            if weekday != period_weekday:
-                continue
-
-            if start_minutes <= current_minutes < end_minutes:
-                return (
-                    True,
-                    self._i18n.msg(
-                        "rules.blackout_denied",
-                        start_time=start_time,
-                        end_time=end_time,
-                    ),
-                )
-        
-        return (False, "")
+        for period_weekday, start_minutes, end_minutes, start_time, end_time in self._parsed_blackout_periods(
+            profile or self._profile()
+        ):
+            if weekday == period_weekday and start_minutes <= current_minutes < end_minutes:
+                return True, self._i18n.msg("rules.blackout_denied", start_time=start_time, end_time=end_time)
+        return False, ""
 
     def _minutes_until_next_blackout(self, dt: datetime, profile: RuleProfile | None = None) -> int | None:
         """Return minutes until next blackout starts, or None if no blackout periods exist."""
-        effective_profile = profile or self._profile()
-        parsed_blackouts = self._parsed_blackout_periods(effective_profile)
+        parsed_blackouts = self._parsed_blackout_periods(profile or self._profile())
         if not parsed_blackouts:
             return None
 
         today_midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        best_minutes: int | None = None
-
-        # Check occurrences in the next 7 days (inclusive of today).
+        best: int | None = None
         for day_offset in range(8):
             target_day = (dt.weekday() + day_offset) % 7
             day_start = today_midnight + timedelta(days=day_offset)
-
             for period_weekday, start_minutes, _, _, _ in parsed_blackouts:
-                if period_weekday == target_day:
-                    start_dt = day_start + timedelta(minutes=start_minutes)
-                    if start_dt > dt:
-                        minutes_until = int((start_dt - dt).total_seconds() // 60)
-                        if best_minutes is None or minutes_until < best_minutes:
-                            best_minutes = minutes_until
-
-        return best_minutes
+                if period_weekday != target_day:
+                    continue
+                start_dt = day_start + timedelta(minutes=start_minutes)
+                if start_dt > dt:
+                    minutes_until = int((start_dt - dt).total_seconds() // 60)
+                    if best is None or minutes_until < best:
+                        best = minutes_until
+        return best
 
     @staticmethod
     def _merged_minutes(ranges: list[tuple[int, int]]) -> int:
@@ -344,18 +314,16 @@ class PlaytimeRules:
     def _load_runtime_state(self, now: datetime, profile: RuleProfile) -> RuntimeState:
         self._update_accrued_playtime(now, profile)
         active = self._store.get_active_session(self._child_id)
-        if active is not None:
+        if active:
             _session_id, start_time, minutes_granted = active
-            elapsed = self._elapsed_minutes(start_time, now)
-            active_remaining = max(0, minutes_granted - elapsed)
+            active_remaining = max(0, minutes_granted - self._elapsed_minutes(start_time, now))
         else:
             active_remaining = 0
         bank_balance = self._store.get_bank_balance(self._child_id)
-        weekly_bank_baseline = self._weekly_bank_baseline(now, bank_balance)
         accrued_playtime, _, rest_accumulated = self._store.get_accrued_playtime(self._child_id)
         return RuntimeState(
             bank_balance=bank_balance,
-            weekly_bank_baseline=weekly_bank_baseline,
+            weekly_bank_baseline=self._weekly_bank_baseline(now, bank_balance),
             accrued_playtime=accrued_playtime,
             rest_accumulated=rest_accumulated,
             active_remaining=active_remaining,
@@ -685,7 +653,7 @@ class PlaytimeRules:
             minutes_until_blackout=minutes_until_blackout,
         )
         weekday = now.weekday()
-        current_minutes = now.hour * 60 + now.minute
+        current_minutes = now.hour * 66 + now.minute
         periods_with_start: list[tuple[int, str]] = []
         for period_weekday, start_minutes, end_minutes, start_time, end_time in self._parsed_blackout_periods(profile):
             if period_weekday != weekday or end_minutes <= current_minutes:

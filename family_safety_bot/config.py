@@ -97,10 +97,9 @@ class Settings:
 
     @staticmethod
     def _parse_duration_minutes(value: str, env_key: str) -> int:
-        minutes = parse_duration_minutes(value)
-        if minutes is None:
-            raise ValueError(f"Invalid duration for {env_key}: {value!r}")
-        return minutes
+        if minutes := parse_duration_minutes(value):
+            return minutes
+        raise ValueError(f"Invalid duration for {env_key}: {value!r}")
 
     @staticmethod
     def _parse_admins_from_env() -> list[str]:

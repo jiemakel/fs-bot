@@ -120,13 +120,11 @@ class PlaytimeManager(Command):
 
     def _initialize_profiles(self) -> None:
         existing = self._store.list_rule_profiles()
-        if not existing:
-            self._store.upsert_rule_profile(self._default_profile)
-            existing = [self._default_profile]
         self._profiles_by_name = {profile.name.lower(): profile for profile in existing}
-        if self._default_profile.name.lower() not in self._profiles_by_name:
+        default_key = self._default_profile.name.lower()
+        if default_key not in self._profiles_by_name:
+            self._profiles_by_name[default_key] = self._default_profile
             self._store.upsert_rule_profile(self._default_profile)
-            self._profiles_by_name[self._default_profile.name.lower()] = self._default_profile
 
         self._active_profile_name_by_child = {}
         for child_id in self._settings.children:
