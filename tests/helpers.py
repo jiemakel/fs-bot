@@ -25,7 +25,7 @@ def build_settings(tmp_path: Path, **overrides: Any) -> Settings:
         name="default",
         weekly_addition_minutes=840,
         max_bank_minutes=2520,
-        break_balance_max_minutes=180,
+        accrued_playtime_max_minutes=180,
         break_recovery_rate=3.0,
         blackout_periods=[],
     )
@@ -44,7 +44,7 @@ def build_settings(tmp_path: Path, **overrides: Any) -> Settings:
         for key in (
             "weekly_addition_minutes",
             "max_bank_minutes",
-            "break_balance_max_minutes",
+            "accrued_playtime_max_minutes",
             "break_recovery_rate",
             "blackout_periods",
         )

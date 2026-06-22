@@ -58,8 +58,7 @@ def parse_activity_claim(text: str) -> int | None:
 
     for split_at in range(1, len(tokens)):
         candidate = " ".join(tokens[:split_at])
-        minutes = parse_duration_minutes(candidate)
-        if minutes is not None and minutes > 0:
+        if (minutes := parse_duration_minutes(candidate)) is not None and minutes > 0:
             best_minutes = minutes
 
     return best_minutes

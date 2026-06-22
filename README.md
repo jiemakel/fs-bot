@@ -5,15 +5,15 @@ Signal group bot for managing children’s playtime with rule-based decisions an
 ## What It Does
 
 - Supports multiple children and admins
-- Tracks per-child playtime bank, active sessions, and break balance
-- Applies blackout periods and break/session limits
+- Tracks per-child playtime bank, active sessions, and accrued playtime
+- Applies blackout periods and accrued-playtime/session limits
 - Automatically grants time through Microsoft Family Safety when rules pass
 - Sends all responses to one Signal group for shared visibility
 
 ## Important Behavior
 
 - Grant requests are approved only if rules pass.
-- Local state (bank/session/break tracking) is updated only after a successful Microsoft API grant.
+- Local state (bank/session/accrued-playtime tracking) is updated only after a successful Microsoft API grant.
 - If Microsoft grant/authentication fails, the request is rejected and local state is unchanged.
 - Ending a session (`end`) first attempts an immediate Microsoft block; if block fails, session is not ended locally.
 
@@ -66,7 +66,7 @@ uv run python main.py
 
 - `WEEKLY_ADDITION_TIME` default `14h`
 - `MAX_BANK_TIME` default `42h`
-- `BREAK_BALANCE_MAX_TIME` default `3h`
+- `ACCRUED_PLAYTIME_MAX_TIME` default `3h`
 - `BREAK_RECOVERY_RATE` default `3.0`
 
 Duration format examples:
@@ -108,7 +108,7 @@ Duration format examples:
 - `<name> +<duration>` add to bank explicitly
 - `<name> -<duration>` remove from bank
 - `<name> =<duration>` set bank directly
-- `break <name> <duration>` set break balance directly
+- `break <name> <duration>` set accrued playtime directly
 - `end <name>` end child session
 - `rollover <name>` force weekly rollover
 - `profile list` list profiles
@@ -126,7 +126,7 @@ Duration format examples:
 
 Under `DATA_DIR`:
 
-- `playtime.sqlite3` playtime/bank/session/break state
+- `playtime.sqlite3` playtime/bank/session/accrued-playtime state
 - `signalbot.sqlite3` SignalBot internal state
 
 ## Development

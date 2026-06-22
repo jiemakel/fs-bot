@@ -6,15 +6,7 @@ import os
 from family_safety_bot.durations import parse_duration_minutes
 
 WEEKDAY_SUFFIXES = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
-WEEKDAY_NAME_TO_INDEX = {
-    "mon": 0,
-    "tue": 1,
-    "wed": 2,
-    "thu": 3,
-    "fri": 4,
-    "sat": 5,
-    "sun": 6,
-}
+WEEKDAY_NAME_TO_INDEX = {suffix.lower(): i for i, suffix in enumerate(WEEKDAY_SUFFIXES)}
 _PROFILE_NAME_ALLOWED_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
 
 
@@ -33,7 +25,7 @@ class RuleProfile:
     name: str
     weekly_addition_minutes: int
     max_bank_minutes: int
-    break_balance_max_minutes: int
+    accrued_playtime_max_minutes: int
     break_recovery_rate: float
     blackout_periods: list[tuple[int, str, str]]
 
@@ -101,6 +93,7 @@ class Settings:
     # General settings
     timezone: str
     data_dir: str
+    bot_language: str = "en"
 
     @staticmethod
     def _parse_duration_minutes(value: str, env_key: str) -> int:
@@ -178,10 +171,10 @@ class Settings:
             os.environ.get("MAX_BANK_TIME", "42h"),
             "MAX_BANK_TIME",
         )
-        # Note: break_balance_max_minutes also serves as the max per request.
-        break_balance_max_minutes = Settings._parse_duration_minutes(
-            os.environ.get("BREAK_BALANCE_MAX_TIME", "3h"),
-            "BREAK_BALANCE_MAX_TIME",
+        # Note: accrued_playtime_max_minutes also serves as the max per request.
+        accrued_playtime_max_minutes = Settings._parse_duration_minutes(
+            os.environ.get("ACCRUED_PLAYTIME_MAX_TIME", os.environ.get("BREAK_BALANCE_MAX_TIME", "3h")),
+            "ACCRUED_PLAYTIME_MAX_TIME",
         )
         break_recovery_rate = float(os.environ.get("BREAK_RECOVERY_RATE", "3.0"))
         
@@ -191,13 +184,14 @@ class Settings:
             name=default_profile_name,
             weekly_addition_minutes=weekly_addition_minutes,
             max_bank_minutes=max_bank_minutes,
-            break_balance_max_minutes=break_balance_max_minutes,
+            accrued_playtime_max_minutes=accrued_playtime_max_minutes,
             break_recovery_rate=break_recovery_rate,
             blackout_periods=blackout_periods,
         )
         
         timezone = os.environ.get("TZ", "Europe/Helsinki")
         data_dir = os.environ.get("DATA_DIR", "./data")
+        bot_language = os.environ.get("BOT_LANGUAGE", "en")
 
         return Settings(
             ms_family_email=ms_family_email,
@@ -208,4 +202,5 @@ class Settings:
             default_rule_profile=default_rule_profile,
             timezone=timezone,
             data_dir=data_dir,
+            bot_language=bot_language,
         )

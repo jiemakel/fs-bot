@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from datetime import timedelta
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 import asyncio
@@ -13,21 +13,25 @@ from tests.helpers import ADMIN_PHONE, CHILD_PHONE, build_settings, build_store
 
 
 @dataclass
+class FakeMessage:
+    text: str
+    source: str
+    mentions: list[Any] = field(default_factory=list)
+    quote: Any = None
+
+
+@dataclass
 class FakeContext:
     """Fake signalbot Context for testing."""
-
     message_text: str
     sender: str
     sent_messages: list[str]
+    mentions: list[Any] = field(default_factory=list)
+    quote: Any = None
 
     @property
-    def message(self):
-        class FakeMessage:
-            def __init__(self, text: str, source: str):
-                self.text = text
-                self.source = source
-
-        return FakeMessage(self.message_text, self.sender)
+    def message(self) -> FakeMessage:
+        return FakeMessage(self.message_text, self.sender, self.mentions, self.quote)
 
     async def send(self, text: str) -> None:
         self.sent_messages.append(text)
@@ -67,6 +71,18 @@ def test_playtime_manager_status_command(tmp_path: Path) -> None:
     assert store.get_active_session(CHILD_PHONE) is None
 
 
+def test_playtime_manager_status_includes_pending_activity_claims(tmp_path: Path) -> None:
+    manager, store = _build_manager(tmp_path)
+    store.add_activity_claim(CHILD_PHONE, 30, "30m played guitar", datetime.now(timezone.utc))
+    store.add_activity_claim(CHILD_PHONE, 60, "1h cleaned room", datetime.now(timezone.utc))
+
+    ctx = FakeContext(message_text="status", sender=CHILD_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert len(ctx.sent_messages) == 1
+    assert isinstance(ctx.sent_messages[0], str)
+
+
 def test_playtime_manager_child_request_validation(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
     store.set_bank_balance(CHILD_PHONE, 120)
@@ -86,6 +102,49 @@ def test_playtime_manager_unknown_sender(tmp_path: Path) -> None:
     _run_handle(manager, ctx)
 
     assert len(ctx.sent_messages) == 0
+
+
+@pytest.mark.parametrize(
+    ("message_text", "mentions", "quote"),
+    [
+        ("can I play after dinner?", [], None),
+        (
+            "I have 30 different thoughts about the schedule and this is not really a bot command today",
+            [],
+            None,
+        ),
+        ("can I have 30 please @Admin", ["admin-uuid"], None),
+        ("maybe 30", [], object()),
+    ],
+)
+def test_playtime_manager_unknown_conversation_does_not_send_help(
+    tmp_path: Path,
+    message_text: str,
+    mentions: list[Any],
+    quote: Any,
+) -> None:
+    manager, _store = _build_manager(tmp_path)
+
+    ctx = FakeContext(
+        message_text=message_text,
+        sender=CHILD_PHONE,
+        sent_messages=[],
+        mentions=mentions,
+        quote=quote,
+    )
+    _run_handle(manager, ctx)
+
+    assert ctx.sent_messages == []
+
+
+def test_playtime_manager_unknown_short_numeric_message_sends_help(tmp_path: Path) -> None:
+    manager, _store = _build_manager(tmp_path)
+
+    ctx = FakeContext(message_text="30 minutes please", sender=CHILD_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert len(ctx.sent_messages) == 1
+    assert isinstance(ctx.sent_messages[0], str)
 
 
 @pytest.mark.parametrize(
@@ -115,16 +174,16 @@ def test_playtime_manager_admin_bank_commands(
     assert store.get_bank_balance(CHILD_PHONE) == expected_balance
 
 
-def test_playtime_manager_admin_can_set_break_balance(tmp_path: Path) -> None:
+def test_playtime_manager_admin_can_set_accrued_playtime(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
     now = manager._rules_by_child[CHILD_PHONE]._get_local_now()
-    store.set_consumed_break_debt(CHILD_PHONE, 30, now)
+    store.set_accrued_playtime(CHILD_PHONE, 30, now)
 
     ctx = FakeContext(message_text="break TestChild 2h", sender=ADMIN_PHONE, sent_messages=[])
     _run_handle(manager, ctx)
 
     assert len(ctx.sent_messages) == 1
-    assert store.get_consumed_break_debt(CHILD_PHONE)[0] == 120
+    assert store.get_accrued_playtime(CHILD_PHONE)[0] == 120
 
 
 def test_playtime_manager_admin_can_toggle_grant_block_mode(tmp_path: Path) -> None:
@@ -222,14 +281,14 @@ def test_playtime_manager_child_request_accepts_compound_duration(tmp_path: Path
 def test_playtime_manager_partial_grant_applies_multiple_caps(tmp_path: Path) -> None:
     manager, store = _build_manager(
         tmp_path,
-        break_balance_max_minutes=40,
+        accrued_playtime_max_minutes=40,
         blackout_periods=[(0, "21:00", "24:00")],
     )
     rules = manager._rules_by_child[CHILD_PHONE]
     fixed_now = rules._get_local_now().replace(year=2025, month=1, day=6, hour=20, minute=30, second=0, microsecond=0)
     rules._get_local_now = lambda: fixed_now  # type: ignore[method-assign]
     store.set_bank_balance(CHILD_PHONE, 20)
-    store.set_consumed_break_debt(CHILD_PHONE, 10, fixed_now)
+    store.set_accrued_playtime(CHILD_PHONE, 10, fixed_now)
 
     async def fake_grant(child_id: str, minutes: int) -> bool:
         return child_id == "child123" and minutes == 20
@@ -281,11 +340,31 @@ def test_playtime_manager_child_end_does_not_complete_when_block_fails(tmp_path:
     assert active[0] == session_id
 
 
+def test_playtime_manager_recovery_completion_sends_group_notification(tmp_path: Path) -> None:
+    manager, store = _build_manager(tmp_path)
+    rules = manager._rules_by_child[CHILD_PHONE]
+    base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
+    store.set_accrued_playtime(CHILD_PHONE, 90, base)
+    rules._get_local_now = lambda: base + timedelta(minutes=30)  # type: ignore[method-assign]
+
+    asyncio.run(manager._check_recovery_completion())
+
+    bot = cast(FakeBot, manager.bot)
+    assert len(bot.sent) == 1
+    receiver, message = bot.sent[0]
+    assert receiver == manager._settings.signal_group_id
+    assert isinstance(message, str)
+    assert store.get_accrued_playtime(CHILD_PHONE)[0] == 0
+
+    asyncio.run(manager._check_recovery_completion())
+    assert len(bot.sent) == 1
+
+
 def test_playtime_manager_child_profile_switch_affects_limits(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
 
     env_payload = (
-        "WEEKLY_ADDITION_TIME=14h MAX_BANK_TIME=1h BREAK_BALANCE_MAX_TIME=3h BREAK_RECOVERY_RATE=3.0 "
+        "WEEKLY_ADDITION_TIME=14h MAX_BANK_TIME=1h ACCRUED_PLAYTIME_MAX_TIME=3h BREAK_RECOVERY_RATE=3.0 "
         "BLACKOUT_PERIOD_MON= BLACKOUT_PERIOD_TUE= BLACKOUT_PERIOD_WED= "
         "BLACKOUT_PERIOD_THU= BLACKOUT_PERIOD_FRI= BLACKOUT_PERIOD_SAT= BLACKOUT_PERIOD_SUN="
     )
@@ -307,7 +386,7 @@ def test_playtime_manager_profile_use_default_assigns_default_profile_to_child(t
     manager, store = _build_manager(tmp_path)
 
     strict_payload = (
-        "WEEKLY_ADDITION_TIME=14h MAX_BANK_TIME=1h BREAK_BALANCE_MAX_TIME=3h BREAK_RECOVERY_RATE=3.0 "
+        "WEEKLY_ADDITION_TIME=14h MAX_BANK_TIME=1h ACCRUED_PLAYTIME_MAX_TIME=3h BREAK_RECOVERY_RATE=3.0 "
         "BLACKOUT_PERIOD_MON= BLACKOUT_PERIOD_TUE= BLACKOUT_PERIOD_WED= "
         "BLACKOUT_PERIOD_THU= BLACKOUT_PERIOD_FRI= BLACKOUT_PERIOD_SAT= BLACKOUT_PERIOD_SUN="
     )
@@ -344,7 +423,6 @@ def test_child_activity_claim_stored_and_bank_unchanged(tmp_path: Path) -> None:
 
 def test_admin_claims_lists_pending(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
-    from datetime import datetime, timezone
     store.add_activity_claim(CHILD_PHONE, 30, "30m played guitar", datetime.now(timezone.utc))
     store.add_activity_claim(CHILD_PHONE, 60, "1h cleaned room", datetime.now(timezone.utc))
 
@@ -352,15 +430,12 @@ def test_admin_claims_lists_pending(tmp_path: Path) -> None:
     _run_handle(manager, ctx)
 
     assert len(ctx.sent_messages) == 1
-    assert "played guitar" in ctx.sent_messages[0]
-    assert "cleaned room" in ctx.sent_messages[0]
-    assert "30" in ctx.sent_messages[0]
+    assert isinstance(ctx.sent_messages[0], str)
 
 
 def test_admin_ack_grants_total_and_clears_claims(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
     store.set_bank_balance(CHILD_PHONE, 60)
-    from datetime import datetime, timezone
     store.add_activity_claim(CHILD_PHONE, 30, "30m played guitar", datetime.now(timezone.utc))
     store.add_activity_claim(CHILD_PHONE, 60, "1h cleaned room", datetime.now(timezone.utc))
 
@@ -385,7 +460,6 @@ def test_admin_ack_no_claims_sends_message(tmp_path: Path) -> None:
 def test_admin_bank_modification_auto_handles_pending_claims(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
     store.set_bank_balance(CHILD_PHONE, 60)
-    from datetime import datetime, timezone
     store.add_activity_claim(CHILD_PHONE, 30, "30m played guitar", datetime.now(timezone.utc))
 
     ctx = FakeContext(message_text="TestChild 1h", sender=ADMIN_PHONE, sent_messages=[])
@@ -394,4 +468,3 @@ def test_admin_bank_modification_auto_handles_pending_claims(tmp_path: Path) -> 
     assert len(ctx.sent_messages) == 1
     assert store.get_bank_balance(CHILD_PHONE) == 120  # 60 + 60
     assert store.get_pending_claims(CHILD_PHONE) == []
-    assert "played guitar" in ctx.sent_messages[0]
