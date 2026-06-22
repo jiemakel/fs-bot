@@ -16,10 +16,10 @@ _OPTIONAL_SETTINGS_ENV_KEYS = (
     "TIMEZONE",
     "DATA_DIR",
     *[f"BLACKOUT_PERIOD_{suffix}" for suffix in WEEKDAY_SUFFIXES],
-    *[f"ADMIN_{index}_PHONE" for index in range(1, 10)],
+    *[f"ADMIN_{index}_PHONE" for index in range(1, 12)],
     *[
         f"CHILD_{index}_{suffix}"
-        for index in range(1, 10)
+        for index in range(1, 12)
         for suffix in ("PHONE", "MS_ID", "NAME")
     ],
 )
@@ -72,6 +72,22 @@ def test_settings_parses_bot_language(monkeypatch) -> None:
     settings = Settings.from_env()
 
     assert settings.bot_language == "fi"
+
+
+def test_settings_parses_more_than_nine_contiguous_admins_and_children(monkeypatch) -> None:
+    monkeypatch.setenv("MS_FAMILY_EMAIL", "parent@example.com")
+    monkeypatch.setenv("MS_FAMILY_PASSWORD", "secret")
+    monkeypatch.setenv("SIGNAL_GROUP_ID", "group.test")
+    for index in range(1, 11):
+        monkeypatch.setenv(f"ADMIN_{index}_PHONE", f"+100000000{index:02d}")
+        monkeypatch.setenv(f"CHILD_{index}_PHONE", f"+200000000{index:02d}")
+        monkeypatch.setenv(f"CHILD_{index}_MS_ID", f"child{index}")
+        monkeypatch.setenv(f"CHILD_{index}_NAME", f"Child{index}")
+
+    settings = Settings.from_env()
+
+    assert settings.signal_admins[-1] == "+10000000010"
+    assert settings.children["+20000000010"].name == "Child10"
 
 
 def test_settings_parses_day_specific_blackout_periods_including_24_00(monkeypatch) -> None:

@@ -20,6 +20,23 @@ _SCREEN_TIME_ENDPOINT = "https://account.microsoft.com/family/api/screen-time-re
 _ROSTER_ENDPOINT = "https://account.microsoft.com/family/api/roster"
 _SCREEN_TIME_OVERRIDE_ENDPOINT = "https://account.microsoft.com/family/api/device-limits/screentime-time-override"
 
+_WEB_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/119.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
 class MicrosoftFamilyApi:
     """Client for Microsoft Family Safety web endpoints."""
 
@@ -35,7 +52,7 @@ class MicrosoftFamilyApi:
         return self._last_status_code
 
     async def aclose(self) -> None:
-        if self._client is not None:
+        if self._client:
             await self._client.aclose()
         self._client = None
         self._authenticated = False
@@ -44,16 +61,13 @@ class MicrosoftFamilyApi:
         if force:
             await self.aclose()
 
-        if self._client is None or not self._authenticated:
-            await self._authenticate_web()
-            return
+        if self._client and self._authenticated:
+            check = await self._client.get(_FAMILY_HOME_URL)
+            if self._is_authenticated_family_response(check):
+                return
+            logger.info("Existing Family Safety session appears expired; re-authenticating.")
+            await self.aclose()
 
-        check = await self._client.get(_FAMILY_HOME_URL)
-        if self._is_authenticated_family_response(check):
-            return
-
-        logger.info("Existing Family Safety session appears expired; re-authenticating.")
-        await self.aclose()
         await self._authenticate_web()
 
     def _require_client(self) -> httpx.AsyncClient:
@@ -64,22 +78,7 @@ class MicrosoftFamilyApi:
     async def _authenticate_web(self) -> None:
         logger.info("Authenticating with Microsoft Family Safety web portal...")
         self._client = httpx.AsyncClient(
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/119.0.0.0 Safari/537.36"
-                ),
-                "Accept": (
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                    "image/avif,image/webp,*/*;q=0.8"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
-                "DNT": "1",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-            },
+            headers=_WEB_HEADERS,
             timeout=httpx.Timeout(30.0),
             follow_redirects=True,
         )
@@ -133,7 +132,7 @@ class MicrosoftFamilyApi:
         for _ in range(3):
             parsed = self._parse_auto_submit_form(current.text)
             if not parsed:
-                return current
+                break
             action, method, fields = parsed
             target = urljoin(str(current.url), action)
             if method.lower() == "post":
@@ -148,9 +147,8 @@ class MicrosoftFamilyApi:
         for _ in range(4):
             next_url = self._extract_client_side_redirect_url(current.text)
             if not next_url:
-                return current
-            target = urljoin(str(current.url), next_url)
-            current = await client.get(target)
+                break
+            current = await client.get(urljoin(str(current.url), next_url))
         return current
 
     async def _finalize_family_session(self) -> httpx.Response:
@@ -162,7 +160,7 @@ class MicrosoftFamilyApi:
             response = await self._follow_client_side_redirects(response)
             last_response = response
             if self._is_authenticated_family_response(response):
-                return response
+                break
         if last_response is None:
             raise RuntimeError("Failed to resolve Family Safety session")
         return last_response
@@ -206,14 +204,12 @@ class MicrosoftFamilyApi:
             if 300 <= current.status_code < 400:
                 location = current.headers.get("location")
                 if not location:
-                    return current
+                    break
                 current = await client.get(urljoin(str(current.url), location), follow_redirects=False)
                 continue
 
             parsed_form = self._parse_auto_submit_form(current.text)
             if parsed_form:
-                # Microsoft eventually lands on a plain hidden-input form
-                # ("Continue") that completes silent sign-in with account cookies.
                 action, method, fields = parsed_form
                 target = urljoin(str(current.url), action)
                 if method.lower() == "post":
@@ -235,12 +231,12 @@ class MicrosoftFamilyApi:
                 current = await client.get(urljoin(str(current.url), next_url), follow_redirects=False)
                 continue
 
-            return current
+            break
 
         return current
 
     async def _ensure_ready_client(self) -> httpx.AsyncClient:
-        if self._client is None or not self._authenticated:
+        if not self._client or not self._authenticated:
             await self.ensure_authenticated()
         return self._require_client()
 
@@ -294,31 +290,12 @@ class MicrosoftFamilyApi:
             logger.exception("Network error during time grant: %s", e)
             return False
 
-        self._last_status_code = grant_response.status_code
-        if grant_response.status_code in (200, 201, 204):
-            logger.info(
-                "Successfully granted %s (%s) to child %s",
-                format_duration(minutes),
-                duration,
-                child_id,
-            )
-            return True
-        if grant_response.status_code == 401:
-            logger.error("Authentication expired or invalid.")
-            return False
-        if grant_response.status_code == 403:
-            logger.error("Access denied (403). Check child id and account permissions.")
-            return False
-        if grant_response.status_code == 404:
-            logger.error("API endpoint not found. Microsoft may have changed the API.")
-            return False
-
-        logger.warning(
-            "API returned unexpected status %d: %s",
-            grant_response.status_code,
-            grant_response.text[:200],
+        return self._handle_api_response(
+            grant_response,
+            "grant",
+            format_duration(minutes),
+            child_id,
         )
-        return False
 
     async def _block_web(self, child_id: str) -> bool:
         logger.info("WEB: Blocking child %s on windows via Family Safety API", child_id)
@@ -370,34 +347,7 @@ class MicrosoftFamilyApi:
             logger.exception("Network error during time block: %s", e)
             return False
 
-        self._last_status_code = block_response.status_code
-        if block_response.status_code in (200, 201, 204):
-            logger.info("Successfully blocked child %s until %s", child_id, block_until_utc)
-            return True
-        if block_response.status_code == 401:
-            logger.error("Authentication expired or invalid.")
-            return False
-        if block_response.status_code == 403:
-            logger.error("Access denied (403). Check child id and account permissions.")
-            return False
-        if block_response.status_code == 404:
-            logger.error("Block API endpoint not found. Microsoft may have changed the API.")
-            return False
-
-        if block_response.status_code == 400:
-            logger.error(
-                "Block API returned 400. payload=%s response=%s",
-                payload,
-                block_response.text,
-            )
-            return False
-        logger.warning(
-            "Block API returned unexpected status %d: %s (payload=%s)",
-            block_response.status_code,
-            block_response.text[:500],
-            payload,
-        )
-        return False
+        return self._handle_api_response(block_response, "block", child_id=child_id)
 
     async def _fetch_relationship_jwt(
         self,
@@ -450,23 +400,55 @@ class MicrosoftFamilyApi:
         block_until = datetime.now(timezone.utc) + timedelta(minutes=max(1, delay_minutes))
         return block_until.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
+    def _handle_api_response(
+        self,
+        response: httpx.Response,
+        action: str,
+        duration_or_child_id: str | None = None,
+        child_id: str | None = None,
+    ) -> bool:
+        """Handle API response with consistent error logging."""
+        self._last_status_code = response.status_code
+
+        if response.status_code in (200, 201, 204):
+            if action == "grant" and duration_or_child_id and child_id:
+                logger.info("Successfully granted %s to child %s", duration_or_child_id, child_id)
+            elif action == "block" and child_id:
+                logger.info("Successfully blocked child %s", child_id)
+            return True
+
+        errors = {
+            401: "Authentication expired or invalid.",
+            403: "Access denied (403). Check child id and account permissions.",
+            404: f"{action.capitalize()} API endpoint not found. Microsoft may have changed the API.",
+            400: f"{action.capitalize()} API returned 400.",
+        }
+
+        if response.status_code in errors:
+            logger.error(errors[response.status_code])
+            return False
+
+        logger.warning(
+            "%s API returned unexpected status %d: %s",
+            action.capitalize(),
+            response.status_code,
+            response.text[:200] if action == "grant" else response.text[:500],
+        )
+        return False
+
     @staticmethod
     def _raise_on_login_error(response: httpx.Response) -> None:
-        response_text_lower = response.text.lower()
-        response_url_lower = str(response.url).lower()
-        if (
-            "password is incorrect" in response_text_lower
-            or "password you entered is incorrect" in response_text_lower
+        text = response.text.lower()
+        url = str(response.url).lower()
+        for keywords, message in (
+            (["password is incorrect", "password you entered is incorrect"], "Login failed: Incorrect password"),
+            (["account doesn't exist", "couldn't find your account"], "Login failed: Account doesn't exist"),
         ):
-            raise ValueError("Login failed: Incorrect password")
-        if (
-            "account doesn't exist" in response_text_lower
-            or "couldn't find your account" in response_text_lower
-        ):
-            raise ValueError("Login failed: Account doesn't exist")
-        if "help us protect your account" in response_text_lower:
+            if any(kw in text for kw in keywords):
+                raise ValueError(message)
+        if "help us protect your account" in text:
             raise ValueError("Microsoft requires additional verification")
-        if "proofup" in response_url_lower or "mfaenter" in response_url_lower:
+        if "proofup" in url or "mfaenter" in url:
             raise ValueError("Two-factor authentication detected but not supported")
 
     @staticmethod
@@ -505,22 +487,21 @@ class MicrosoftFamilyApi:
 
     @staticmethod
     def _extract_ppft(page_content: str, server_data: dict | None) -> str | None:
-        ppft_match = re.search(r'name=["\']PPFT["\'][^>]*value=["\']([^"\']+)["\']', page_content)
-        if not ppft_match:
-            ppft_match = re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']PPFT["\']', page_content)
-        if ppft_match:
-            return ppft_match.group(1)
-        if server_data is None:
-            return None
-        sft_tag = server_data.get("sFTTag")
-        if not isinstance(sft_tag, str):
-            return None
-        sft_tag_unescaped = unescape(sft_tag)
-        ppft_match = re.search(
+        patterns = [
             r'name=["\']PPFT["\'][^>]*value=["\']([^"\']+)["\']',
-            sft_tag_unescaped,
-        )
-        return ppft_match.group(1) if ppft_match else None
+            r'value=["\']([^"\']+)["\'][^>]*name=["\']PPFT["\']',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, page_content)
+            if match:
+                return match.group(1)
+
+        if server_data and isinstance(server_data.get("sFTTag"), str):
+            sft_tag_unescaped = unescape(server_data["sFTTag"])
+            match = re.search(r'name=["\']PPFT["\'][^>]*value=["\']([^"\']+)["\']', sft_tag_unescaped)
+            if match:
+                return match.group(1)
+        return None
 
     @staticmethod
     def _extract_login_post_url(page_content: str, server_data: dict | None, fallback: str) -> str:

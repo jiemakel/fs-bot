@@ -25,22 +25,20 @@ def parse_duration_minutes(value: str) -> int | None:
         if not text:
             return None
 
-    total_minutes = 0.0
+    total = 0.0
     pos = 0
-    seen = False
     for match in _DURATION_TOKEN_RE.finditer(text):
-        separator = text[pos:match.start()]
-        if separator and separator.strip(" +"):
+        sep = text[pos : match.start()]
+        if sep and sep.strip(" +"):
             return None
         amount = float(match.group(1))
-        unit = match.group(2)
-        total_minutes += amount * 60 if unit == "h" else amount
+        total += amount * 60 if match.group(2) == "h" else amount
         pos = match.end()
-        seen = True
 
-    if not seen or (text[pos:] and text[pos:].strip(" +")):
+    trailing = text[pos:]
+    if pos == 0 or (trailing and trailing.strip(" +")):
         return None
-    return int(round(total_minutes * multiplier))
+    return int(round(total * multiplier))
 
 
 def parse_activity_claim(text: str) -> int | None:
@@ -73,12 +71,8 @@ def parse_signed_duration_minutes(value: str) -> int | None:
     if not text:
         return None
 
-    sign = 1
+    sign = -1 if text[0] == "-" else 1
     if text[0] in "+-=":
-        sign = -1 if text[0] == "-" else 1
         text = text[1:].strip()
-
     minutes = parse_duration_minutes(text)
-    if minutes is None:
-        return None
-    return sign * minutes
+    return None if minutes is None else sign * minutes

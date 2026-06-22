@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 _LOCALES_DIR = Path(__file__).with_name("locales")
 
@@ -25,20 +25,13 @@ class I18n:
         return loaded
 
     def __init__(self, language: str = "en") -> None:
-        normalized = language.strip().lower()
-        self.language = normalized or "en"
+        self.language = language.strip().lower() or "en"
         self._data = self._load_catalog(self.language)
 
     def command_aliases(self, key: str) -> list[str]:
-        value = self._data["commands"].get(key, [])
-        if isinstance(value, str):
-            return [value.lower()]
-        if isinstance(value, list):
-            return [str(v).lower() for v in value]
-        return []
+        aliases = cast(list[str], self._data["commands"][key])
+        return [alias.lower() for alias in aliases]
 
     def msg(self, key: str, **kwargs: Any) -> str:
-        template = self._data["messages"].get(key, key)
-        if not isinstance(template, str):
-            return key
+        template = cast(str, self._data["messages"].get(key, key))
         return template.format(**kwargs)

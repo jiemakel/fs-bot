@@ -5,10 +5,11 @@ import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import TypeAlias
 
 from family_safety_bot.config import RuleProfile
 
-ActiveSession = tuple[int, datetime, int]
+ActiveSession: TypeAlias = tuple[int, datetime, int]
 
 
 def _parse_stored_datetime(iso: str) -> datetime:
@@ -156,15 +157,11 @@ class PlaytimeStore:
             return []
         if not isinstance(loaded, list):
             return []
-        periods: list[tuple[int, str, str]] = []
-        for item in loaded:
-            if not isinstance(item, list) or len(item) != 3:
-                continue
-            weekday, start_time, end_time = item
-            if not isinstance(weekday, int):
-                continue
-            periods.append((weekday, str(start_time), str(end_time)))
-        return periods
+        return [
+            (int(item[0]), str(item[1]), str(item[2]))
+            for item in loaded
+            if isinstance(item, list) and len(item) == 3
+        ]
 
     @classmethod
     def _rule_profile_from_row(cls, row: tuple) -> RuleProfile:
@@ -426,15 +423,8 @@ class PlaytimeStore:
         raw = self._get_app_state(f"recovery_abort:{child_id}")
         if not raw:
             return None
-        parts = raw.split("|", 1)
-        if len(parts) != 2:
-            return None
-        try:
-            saved_rest = float(parts[0])
-            abort_time = _parse_stored_datetime(parts[1])
-        except (ValueError, TypeError):
-            return None
-        return (saved_rest, abort_time)
+        saved_rest, abort_time_iso = raw.split("|", 1)
+        return (float(saved_rest), _parse_stored_datetime(abort_time_iso))
 
     def clear_recovery_abort(self, child_id: str) -> None:
         """Remove any recorded recovery abort for a child."""

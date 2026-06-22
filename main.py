@@ -56,7 +56,7 @@ def main() -> None:
     logging.info("  Default profile: %s", settings.default_rule_profile.name)
     logging.info("  Weekly addition: %s", format_duration(settings.default_rule_profile.weekly_addition_minutes))
     logging.info("  Max bank: %s", format_duration(settings.default_rule_profile.max_bank_minutes))
-    logging.info("  Break balance max: %s", format_duration(settings.default_rule_profile.break_balance_max_minutes))
+    logging.info("  Accrued playtime max: %s", format_duration(settings.default_rule_profile.accrued_playtime_max_minutes))
     logging.info("  Break recovery rate: %.1fx", settings.default_rule_profile.break_recovery_rate)
     
     bot.start()

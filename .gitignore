@@ -23,3 +23,4 @@ data/*.sqlite3
 data/*.sqlite3-*
 data/signal-cli/
 .env
+*.tar

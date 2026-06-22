@@ -297,77 +297,84 @@ class PlaytimeManager(Command):
         parts = payload.split()
         subcommand = parts[0].lower()
 
-        if subcommand in self._commands["admin_profile_list"]:
-            ordered = sorted(self._profiles_by_name.values(), key=lambda p: p.name.lower())
-            lines = [
-                f"* {profile.name}"
-                + (
-                    self._i18n.msg("watcher.profile_default_marker")
-                    if profile.name.lower() == self._default_profile.name.lower()
-                    else ""
-                )
-                for profile in ordered
-            ]
-            await ctx.send(self._i18n.msg("watcher.profile_list_header") + "\n" + "\n".join(lines))
-            return
-
-        if subcommand in self._commands["admin_profile_show"]:
-            if len(parts) != 2:
-                await ctx.send(self._i18n.msg("watcher.profile_usage"))
-                return
-            profile = self._profiles_by_name.get(parts[1].lower())
-            if profile is None:
-                await ctx.send(self._i18n.msg("watcher.profile_unknown", profile_name=parts[1]))
-                return
-            await ctx.send(self._profile_summary(profile))
-            return
-
-        if subcommand in self._commands["admin_profile_use"]:
-            if len(parts) != 3:
-                await ctx.send(self._i18n.msg("watcher.profile_usage"))
-                return
-            profile = self._profiles_by_name.get(parts[1].lower())
-            if profile is None:
-                await ctx.send(self._i18n.msg("watcher.profile_unknown", profile_name=parts[1]))
-                return
-            resolved = await self._resolve_child(ctx, parts[2])
-            if not resolved:
-                return
-            child, _child_rules = resolved
-            self._active_profile_name_by_child[child.phone_number] = profile.name
-            self._store.set_active_rule_profile_name_for_child(child.phone_number, profile.name)
-            await ctx.send(self._i18n.msg("watcher.profile_switched", child_name=child.name, profile_name=profile.name))
-            return
-
         if subcommand in self._commands["admin_profile_define"]:
-            parts = payload.split(maxsplit=2)
-            if len(parts) != 3:
-                await ctx.send(self._i18n.msg("watcher.profile_usage"))
-                return
-            try:
-                name = normalize_profile_name(parts[1])
-            except ValueError:
-                await ctx.send(self._i18n.msg("watcher.profile_invalid"))
-                return
-            assignments = self._parse_env_assignments(parts[2])
-            if assignments is None:
-                await ctx.send(self._i18n.msg("watcher.profile_invalid"))
-                return
-            try:
-                created = self._build_profile_from_env_assignments(name, assignments)
-            except ValueError:
-                await ctx.send(self._i18n.msg("watcher.profile_invalid"))
-                return
-            self._store.upsert_rule_profile(created)
-            self._profiles_by_name[name.lower()] = created
-            await ctx.send(
-                self._i18n.msg("watcher.profile_defined", profile_name=name)
-                + "\n"
-                + self._profile_summary(created)
-            )
+            await self._do_profile_define(ctx, payload)
             return
+
+        handlers: dict[str, Callable[[Context, list[str]], Awaitable[None]]] = {
+            "admin_profile_list": self._do_profile_list,
+            "admin_profile_show": self._do_profile_show,
+            "admin_profile_use": self._do_profile_use,
+        }
+
+        for key, handler in handlers.items():
+            if subcommand in self._commands[key]:
+                await handler(ctx, parts)
+                return
 
         await ctx.send(self._i18n.msg("watcher.profile_usage"))
+
+    async def _do_profile_list(self, ctx: Context, parts: list[str]) -> None:
+        ordered = sorted(self._profiles_by_name.values(), key=lambda p: p.name.lower())
+        lines = [
+            f"* {profile.name}"
+            + (self._i18n.msg("watcher.profile_default_marker") if profile.name.lower() == self._default_profile.name.lower() else "")
+            for profile in ordered
+        ]
+        await ctx.send(self._i18n.msg("watcher.profile_list_header") + "\n" + "\n".join(lines))
+
+    async def _do_profile_show(self, ctx: Context, parts: list[str]) -> None:
+        if len(parts) != 2:
+            await ctx.send(self._i18n.msg("watcher.profile_usage"))
+            return
+        profile = self._profiles_by_name.get(parts[1].lower())
+        if profile is None:
+            await ctx.send(self._i18n.msg("watcher.profile_unknown", profile_name=parts[1]))
+            return
+        await ctx.send(self._profile_summary(profile))
+
+    async def _do_profile_use(self, ctx: Context, parts: list[str]) -> None:
+        if len(parts) != 3:
+            await ctx.send(self._i18n.msg("watcher.profile_usage"))
+            return
+        profile = self._profiles_by_name.get(parts[1].lower())
+        if profile is None:
+            await ctx.send(self._i18n.msg("watcher.profile_unknown", profile_name=parts[1]))
+            return
+        resolved = await self._resolve_child(ctx, parts[2])
+        if not resolved:
+            return
+        child, _ = resolved
+        self._active_profile_name_by_child[child.phone_number] = profile.name
+        self._store.set_active_rule_profile_name_for_child(child.phone_number, profile.name)
+        await ctx.send(self._i18n.msg("watcher.profile_switched", child_name=child.name, profile_name=profile.name))
+
+    async def _do_profile_define(self, ctx: Context, payload: str) -> None:
+        parts = payload.split(maxsplit=2)
+        if len(parts) != 3:
+            await ctx.send(self._i18n.msg("watcher.profile_usage"))
+            return
+        try:
+            name = normalize_profile_name(parts[1])
+        except ValueError:
+            await ctx.send(self._i18n.msg("watcher.profile_invalid"))
+            return
+        assignments = self._parse_env_assignments(parts[2])
+        if assignments is None:
+            await ctx.send(self._i18n.msg("watcher.profile_invalid"))
+            return
+        try:
+            created = self._build_profile_from_env_assignments(name, assignments)
+        except ValueError:
+            await ctx.send(self._i18n.msg("watcher.profile_invalid"))
+            return
+        self._store.upsert_rule_profile(created)
+        self._profiles_by_name[name.lower()] = created
+        await ctx.send(
+            self._i18n.msg("watcher.profile_defined", profile_name=name)
+            + "\n"
+            + self._profile_summary(created)
+        )
 
     async def _run_for_resolved_children(
         self,
@@ -442,19 +449,19 @@ class PlaytimeManager(Command):
         return await self._run_for_resolved_children(ctx, payload, lambda c, r: self.admin_block_child_command(ctx, c, r))
 
     async def _handle_admin_unblock_command(self, ctx: Context, payload: str) -> bool:
-        async def action(child: Child, _rules: PlaytimeRules) -> None:
-            self._store.set_child_block_mode(child.phone_number, False)
-            await ctx.send(self._i18n.msg("watcher.admin_child_unblocked", child_name=child.name))
-        return await self._run_for_resolved_children(ctx, payload, action)
+        return await self._run_for_resolved_children(ctx, payload, lambda c, r: self._unblock_action(ctx, c))
+
+    async def _unblock_action(self, ctx: Context, child: Child) -> None:
+        self._store.set_child_block_mode(child.phone_number, False)
+        await ctx.send(self._i18n.msg("watcher.admin_child_unblocked", child_name=child.name))
 
     async def _handle_admin_test_command(self, ctx: Context, payload: str) -> bool:
-        async def action(child: Child, rules: PlaytimeRules, minutes: int, _is_relative: bool) -> None:
-            await self.request_command(ctx, child, rules, minutes, child.name + " (TEST)")
-        return await self._run_for_resolved_children_and_minutes(ctx, payload, parse_duration_minutes, action)
+        return await self._run_for_resolved_children_and_minutes(
+            ctx, payload, parse_duration_minutes, lambda c, r, m, _: self.request_command(ctx, c, r, m, c.name + " (TEST)")
+        )
 
     async def _handle_admin_end_command(self, ctx: Context, payload: str) -> bool:
         return await self._run_for_resolved_children(ctx, payload, lambda c, r: self.admin_end_session_command(ctx, c, r))
-
 
     async def _handle_admin_rollover_command(self, ctx: Context, payload: str) -> bool:
         async def action(child: Child, rules: PlaytimeRules) -> None:
@@ -527,30 +534,29 @@ class PlaytimeManager(Command):
         )
         logger.info("Scheduled recovery completion check every minute")
 
-    async def handle(self, ctx: Context) -> None:
+    async def handle(self, context: Context) -> None:
         """Handle incoming messages from the group."""
-        raw_text = ctx.message.text
+        raw_text = context.message.text
         if raw_text is None:
             return
         message_text = raw_text.strip()
         if not message_text:
             return
         message_lower = message_text.lower()
-        sender = ctx.message.source
+        sender = context.message.source
         
         is_admin = sender in self._settings.signal_admins
         child = self._settings.children.get(sender)
-        is_child = child is not None
+        child_context = (child, self._rules_by_child[sender]) if child is not None else None
         
-        if not (is_admin or is_child):
+        if not is_admin and child_context is None:
             logger.info("Ignoring message from unknown sender in group: %s", sender)
             return
         
-        sender_name = child.name if is_child else "Admin"
-        rules = self._rules_by_child.get(sender) if is_child else None
+        sender_name = child.name if child is not None else "Admin"
         
         if message_lower in self._commands["help"]:
-            await ctx.send(self._i18n.msg("watcher.help_admin" if is_admin else "watcher.help_child"))
+            await context.send(self._i18n.msg("watcher.help_admin" if is_admin else "watcher.help_child"))
             return
 
         if message_lower in self._commands["status"]:
@@ -558,33 +564,36 @@ class PlaytimeManager(Command):
                 self._format_child_status_section(phone, child_obj)
                 for phone, child_obj in self._settings.children.items()
             ]
-            await ctx.send("\n\n".join(child_sections))
+            await context.send("\n\n".join(child_sections))
             return
 
         parsed_minutes = parse_duration_minutes(message_text)
-        if parsed_minutes is not None and rules is not None:
-            await self.request_command(ctx, child, rules, parsed_minutes, sender_name)
+        if parsed_minutes is not None and child_context is not None:
+            child, rules = child_context
+            await self.request_command(context, child, rules, parsed_minutes, sender_name)
             return
 
-        if is_child and rules is not None:
+        if child_context is not None:
+            child, rules = child_context
             claim_minutes = parse_activity_claim(message_text)
             if claim_minutes is not None:
-                await self.claim_command(ctx, child, claim_minutes, message_text, sender_name)
+                await self.claim_command(context, child, claim_minutes, message_text, sender_name)
                 return
 
-        if is_child and NUMERIC_ONLY_RE.match(message_text):
-            await ctx.send(self._i18n.msg("watcher.numeric_unit_required", sender_name=sender_name))
+        if child_context is not None and NUMERIC_ONLY_RE.match(message_text):
+            await context.send(self._i18n.msg("watcher.numeric_unit_required", sender_name=sender_name))
             return
 
-        if message_lower in self._commands["end"] and rules is not None:
-            await self.end_session_command(ctx, child, rules, sender_name)
+        if message_lower in self._commands["end"] and child_context is not None:
+            child, rules = child_context
+            await self.end_session_command(context, child, rules, sender_name)
             return
 
-        if is_admin and await self._handle_admin_command(ctx, message_text):
+        if is_admin and await self._handle_admin_command(context, message_text):
             return
         
-        if self._should_send_implicit_help(ctx, message_text):
-            await ctx.send(self._i18n.msg("watcher.help_admin" if is_admin else "watcher.help_child"))
+        if self._should_send_implicit_help(context, message_text):
+            await context.send(self._i18n.msg("watcher.help_admin" if is_admin else "watcher.help_child"))
 
     async def _call_ms_api_with_retry(
         self,

@@ -92,10 +92,7 @@ class PlaytimeRules:
 
     def _current_week_start(self, now: datetime) -> datetime:
         return (now - timedelta(days=now.weekday())).replace(
-            hour=0,
-            minute=0,
-            second=0,
-            microsecond=0,
+            hour=0, minute=0, second=0, microsecond=0
         )
 
     def _current_week_start_iso(self, now: datetime) -> str:
@@ -163,7 +160,7 @@ class PlaytimeRules:
         play_minutes = 0.0
         play_end = last_update
         active = self._store.get_active_session(self._child_id)
-        if active:
+        if active is not None:
             session_id, start_time, minutes_granted = active
             session_end = start_time + timedelta(minutes=minutes_granted)
 
@@ -179,13 +176,11 @@ class PlaytimeRules:
 
         if play_minutes > 0:
             # Play occurred: add debt and reset rest accumulation.
-            # Any rest after the session ended starts a fresh accumulation period.
             new_debt = accrued_playtime + play_minutes
             new_rest_accumulated = (now - play_end).total_seconds() / 60 if play_end < now else 0.0
         else:
-            non_play_minutes = max(0.0, time_passed - play_minutes)
             new_debt = float(accrued_playtime)
-            new_rest_accumulated = rest_accumulated + non_play_minutes
+            new_rest_accumulated = rest_accumulated + max(0.0, time_passed)
 
         recovery_completion: RecoveryCompletion | None = None
 
@@ -349,7 +344,7 @@ class PlaytimeRules:
     def _load_runtime_state(self, now: datetime, profile: RuleProfile) -> RuntimeState:
         self._update_accrued_playtime(now, profile)
         active = self._store.get_active_session(self._child_id)
-        if active:
+        if active is not None:
             _session_id, start_time, minutes_granted = active
             elapsed = self._elapsed_minutes(start_time, now)
             active_remaining = max(0, minutes_granted - elapsed)
@@ -541,7 +536,7 @@ class PlaytimeRules:
 
         # Detect recovery abort: starting a NEW session while mid-recovery.
         recovery_aborted = (
-            not state.active_session
+            state.active_session is None
             and state.accrued_playtime > 0
             and state.rest_accumulated > 0
         )
@@ -550,7 +545,7 @@ class PlaytimeRules:
         else:
             self._store.clear_recovery_abort(self._child_id)
 
-        if state.active_session:
+        if state.active_session is not None:
             session_id, _start_time, current_granted = state.active_session
             new_total_granted = current_granted + additional_minutes
             self._store.set_session_minutes_granted(session_id, new_total_granted)
@@ -558,7 +553,7 @@ class PlaytimeRules:
             session_id = self._store.add_session(self._child_id, now, minutes)
 
         lines = [self._i18n.msg("rules.grant_confirm", minutes=format_duration(minutes))]
-        if state.active_session:
+        if state.active_session is not None:
             lines.append(self._i18n.msg("rules.added_now", minutes=format_duration(additional_minutes)))
         lines.extend(
             [
@@ -598,7 +593,7 @@ class PlaytimeRules:
         self._update_accrued_playtime(now, profile)
         active = self._store.get_active_session(self._child_id)
         
-        if not active:
+        if active is None:
             return self._i18n.msg("rules.no_active_session")
         
         session_id, start_time, minutes_granted = active
@@ -607,6 +602,7 @@ class PlaytimeRules:
         elapsed_minutes = self._elapsed_minutes(start_time, now)
         actual_minutes = min(elapsed_minutes, minutes_granted)
         ended_early = actual_minutes < minutes_granted
+        unused = 0
 
         # If ended early, credit the unused time back to bank
         if ended_early:
@@ -618,7 +614,7 @@ class PlaytimeRules:
         self._store.complete_session(session_id, now)
 
         # Check if this stop is within the 1-minute grace window after a recovery abort.
-        recovery_restored = False
+        restored_rest_accumulated: float | None = None
         abort = self._store.get_recovery_abort(self._child_id)
         if abort is not None:
             saved_rest, abort_time = abort
@@ -627,16 +623,16 @@ class PlaytimeRules:
                 # Restore saved rest_accumulated so recovery continues as if uninterrupted.
                 current_playtime, _, _ = self._store.get_accrued_playtime(self._child_id)
                 self._store.set_accrued_playtime(self._child_id, current_playtime, now, saved_rest)
-                recovery_restored = True
+                restored_rest_accumulated = saved_rest
             self._store.clear_recovery_abort(self._child_id)
         
         message = self._i18n.msg("rules.session_completed", minutes=format_duration(actual_minutes))
         if ended_early:
             message += self._i18n.msg("rules.session_completed_credited", minutes=format_duration(unused))
-        if recovery_restored:
+        if restored_rest_accumulated is not None:
             message += "\n" + self._i18n.msg(
                 "rules.recovery_restored",
-                rest_done=format_duration(int(saved_rest)),
+                rest_done=format_duration(int(restored_rest_accumulated)),
             )
         
         return message
@@ -701,7 +697,7 @@ class PlaytimeRules:
         # Blackout check
         is_blackout, _blackout_reason = self._is_in_blackout_period(now, profile)
         if is_blackout:
-            max_target_from_now = state.active_remaining if state.active_session else 0
+            max_target_from_now = state.active_remaining if state.active_session is not None else 0
         if today_blackout_periods:
             lines.append(
                 self._i18n.msg(
@@ -710,7 +706,7 @@ class PlaytimeRules:
                 )
             )
             lines.append("")
-        if state.active_session:
+        if state.active_session is not None:
             lines.append(self._i18n.msg("rules.status_active_session", minutes=format_duration(state.active_remaining)))
             additional_minutes = max(0, max_target_from_now - state.active_remaining)
             lines.append(
@@ -729,7 +725,7 @@ class PlaytimeRules:
         if recovery_basis > 0:
             recovery_time = self._recovery_minutes(recovery_basis, profile)
             lines.append(self._i18n.msg("rules.status_recovery_rate", rate=profile.break_recovery_rate))
-            if state.active_session:
+            if state.active_session is not None:
                 lines.append(
                     self._i18n.msg(
                         "rules.status_recovery_needed_active",
