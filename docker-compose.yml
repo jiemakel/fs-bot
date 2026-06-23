@@ -1,7 +1,23 @@
+version: "3"
 services:
-  playtime-bot:
+  signal-cli-rest-api:
+    image: bbernhard/signal-cli-rest-api:latest
     environment:
-      SIGNAL_SERVICE: ${SIGNAL_SERVICE}
+      - MODE=json-rpc
+      - JSON_RPC_IGNORE_ATTACHMENTS=true
+      - JSON_RPC_IGNORE_STORIES=true
+      - JSON_RPC_IGNORE_AVATARS=true
+      - JSON_RPC_IGNORE_STICKERS=true 
+    ports:
+      - "8080:8080"
+    volumes:
+      - "signal-cli-data:/home/.local/share/signal-cli" # the folder contains the password and cryptographic keys when a new number is registered
+    restart: unless-stopped
+      
+  fs-bot:
+    image: jiemakel/fs-bot:latest
+    environment:
+      SIGNAL_SERVICE: signal-cli-rest-api:8080
       PHONE_NUMBER: ${PHONE_NUMBER}
       SIGNAL_GROUP_ID: ${SIGNAL_GROUP_ID}
 
@@ -20,7 +36,7 @@ services:
 
       WEEKLY_ADDITION_TIME: ${WEEKLY_ADDITION_TIME}
       MAX_BANK_TIME: ${MAX_BANK_TIME}
-      ACCRUED_PLAYTIME_MAX_TIME: ${ACCRUED_PLAYTIME_MAX_TIME}
+      BREAK_BALANCE_MAX_TIME: ${BREAK_BALANCE_MAX_TIME}
       BREAK_RECOVERY_RATE: ${BREAK_RECOVERY_RATE}
 
       BLACKOUT_PERIOD_MON: ${BLACKOUT_PERIOD_MON}
@@ -37,18 +53,9 @@ services:
     depends_on:
       - signal-cli-rest-api
     volumes:
-      - ./data:/app/data
-    restart: unless-stopped
-
-  signal-cli-rest-api:
-    image: bbernhard/signal-cli-rest-api:latest
-    environment:
-      - MODE=json-rpc
-    ports:
-      - "8080:8080"
-    volumes:
-      - signal-cli-data:/home/.local/share/signal-cli
-    restart: unless-stopped
-
+      - fs-bot-data:/app/data
+    restart: unless-stopped    
+    
 volumes:
   signal-cli-data:
+  fs-bot-data:
