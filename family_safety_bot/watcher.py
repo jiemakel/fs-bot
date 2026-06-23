@@ -166,27 +166,20 @@ class PlaytimeManager(Command):
         payload: str,
         parse_minutes: Callable[[str], int | None],
     ) -> tuple[list[tuple[Child, PlaytimeRules]], int, bool] | None:
-        stripped_payload = payload.strip()
-        if not stripped_payload:
+        if not (stripped := payload.strip()):
             return None
 
-        parts = stripped_payload.split(maxsplit=1)
+        parts = stripped.split(maxsplit=1)
         if len(parts) == 2:
             child_name, duration_text = parts
-            minutes = parse_minutes(duration_text)
-            if minutes is not None:
-                resolved = await self._resolve_child(ctx, child_name)
-                if not resolved:
-                    return None
-                child, child_rules = resolved
-                is_relative = not duration_text.lstrip().startswith("=")
-                return ([(child, child_rules)], minutes, is_relative)
+            if (minutes := parse_minutes(duration_text)) is not None:
+                if resolved := await self._resolve_child(ctx, child_name):
+                    return ([(resolved[0], resolved[1])], minutes, not duration_text.lstrip().startswith("="))
 
-        minutes = parse_minutes(stripped_payload)
-        if minutes is None:
+        if (minutes := parse_minutes(stripped)) is None:
             return None
-        is_relative = not stripped_payload.lstrip().startswith("=")
-        return (self._all_children(), minutes, is_relative)
+
+        return (self._all_children(), minutes, not stripped.lstrip().startswith("="))
 
     async def _parse_children_payload(
         self,
@@ -230,58 +223,55 @@ class PlaytimeManager(Command):
             tokens = shlex.split(payload)
         except ValueError:
             return None
-        assignments: dict[str, str] = {}
+        assignments = {}
         for token in tokens:
             if "=" not in token:
                 return None
             key, value = token.split("=", 1)
-            key = key.strip()
-            if not key:
+            if not (key := key.strip()):
                 return None
             assignments[key] = value.strip()
         return assignments
 
     @staticmethod
     def _positive_duration_assignment(assignments: dict[str, str], key: str) -> int:
-        minutes = parse_duration_minutes(assignments[key])
-        if minutes is None or minutes <= 0:
-            raise ValueError
-        return minutes
+        if minutes := parse_duration_minutes(assignments[key]):
+            if minutes > 0:
+                return minutes
+        raise ValueError
 
     def _build_profile_from_env_assignments(self, profile_name: str, assignments: dict[str, str]) -> RuleProfile:
-        if any(key not in assignments for key in _PROFILE_REQUIRED_ENV_KEYS):
+        if missing := set(_PROFILE_REQUIRED_ENV_KEYS) - set(assignments):
+            raise ValueError(f"Missing required keys: {missing}")
+
+        def get_duration(key: str) -> int:
+            if (minutes := parse_duration_minutes(assignments[key])) and minutes > 0:
+                return minutes
             raise ValueError
 
-        weekly_addition_minutes = self._positive_duration_assignment(assignments, "WEEKLY_ADDITION_TIME")
-        max_bank_minutes = self._positive_duration_assignment(assignments, "MAX_BANK_TIME")
-        accrued_playtime_max_minutes = self._positive_duration_assignment(assignments, "ACCRUED_PLAYTIME_MAX_TIME")
+        blackout_periods = [
+            period
+            for suffix in WEEKDAY_SUFFIXES
+            if (day_value := assignments.get(f"BLACKOUT_PERIOD_{suffix}", ""))
+            for period in parse_day_blackout_periods(
+                day_value,
+                WEEKDAY_NAME_TO_INDEX[suffix.lower()],
+                f"profile env BLACKOUT_PERIOD_{suffix}",
+            )
+        ]
+
         try:
             break_recovery_rate = float(assignments["BREAK_RECOVERY_RATE"])
-        except ValueError as exc:
-            raise ValueError from exc
-        if break_recovery_rate <= 0:
-            raise ValueError
-
-        blackout_periods: list[tuple[int, str, str]] = []
-        for suffix in WEEKDAY_SUFFIXES:
-            weekday_key = f"BLACKOUT_PERIOD_{suffix}"
-            day_value = assignments[weekday_key]
-            if not day_value:
-                continue
-            weekday = WEEKDAY_NAME_TO_INDEX[suffix.lower()]
-            blackout_periods.extend(
-                parse_day_blackout_periods(
-                    day_value,
-                    weekday,
-                    source=f"profile env {weekday_key}",
-                )
-            )
+            if break_recovery_rate <= 0:
+                raise ValueError
+        except ValueError:
+            raise ValueError("Invalid BREAK_RECOVERY_RATE")
 
         return RuleProfile(
             name=profile_name,
-            weekly_addition_minutes=weekly_addition_minutes,
-            max_bank_minutes=max_bank_minutes,
-            accrued_playtime_max_minutes=accrued_playtime_max_minutes,
+            weekly_addition_minutes=get_duration("WEEKLY_ADDITION_TIME"),
+            max_bank_minutes=get_duration("MAX_BANK_TIME"),
+            accrued_playtime_max_minutes=get_duration("ACCRUED_PLAYTIME_MAX_TIME"),
             break_recovery_rate=break_recovery_rate,
             blackout_periods=blackout_periods,
         )
@@ -604,15 +594,12 @@ class PlaytimeManager(Command):
                     self._settings.ms_family_email,
                     self._settings.ms_family_password,
                 )
-
             api = self._ms_api
             await api.ensure_authenticated()
-            success = await action(api)
-            if success:
+            if await action(api):
                 return True
             if api.last_status_code != 401:
                 return False
-
             logger.info(
                 "Microsoft %s API returned 401; retrying once with forced re-authentication.",
                 action_name,
@@ -678,13 +665,12 @@ class PlaytimeManager(Command):
                 )
             )
             return
-        
+
         decision = rules.evaluate_request(minutes)
-        
         if not decision.allowed:
             await ctx.send(self._i18n.msg("watcher.request_denied", sender_name=sender_name, reason=decision.reason))
             return
-        
+
         try:
             grant_success = await self._grant_via_ms_api(child.ms_account_id, decision.minutes_granted)
         except (ValueError, RuntimeError, httpx.HTTPError):
@@ -696,13 +682,11 @@ class PlaytimeManager(Command):
             return
 
         _, message = rules.grant_playtime(decision.minutes_granted)
-
-        response_lines = [f"[{sender_name}]"]
+        response = f"[{sender_name}]"
         if decision.reason:
-            response_lines.append(decision.reason)
-        response_lines.append(message)
-
-        await ctx.send("\n".join(response_lines))
+            response += f"\n{decision.reason}"
+        response += f"\n{message}"
+        await ctx.send(response)
 
     async def admin_block_child_command(self, ctx: Context, child: Child, rules: PlaytimeRules) -> None:
         """Enable grant block mode for a child and end any active session."""

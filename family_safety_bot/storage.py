@@ -154,12 +154,10 @@ class PlaytimeStore:
             loaded = json.loads(raw)
         except json.JSONDecodeError:
             return []
-        if not isinstance(loaded, list):
-            return []
         return [
             (int(item[0]), str(item[1]), str(item[2]))
-            for item in loaded
-            if isinstance(item, list) and len(item) == 3
+            for item in (loaded if isinstance(loaded, list) else [])
+            if isinstance(item, (list, tuple)) and len(item) >= 3
         ]
 
     @classmethod

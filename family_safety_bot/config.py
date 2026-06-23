@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import count
 import os
 
 from family_safety_bot.durations import parse_duration_minutes
@@ -36,10 +37,8 @@ def parse_clock_minutes(value: str) -> int | None:
     except ValueError:
         return None
     if hours == 24 and minutes == 0:
-        return 24 * 60
-    if 0 <= hours <= 23 and 0 <= minutes <= 59:
-        return hours * 60 + minutes
-    return None
+        return 1440
+    return hours * 60 + minutes if 0 <= hours <= 23 and 0 <= minutes <= 59 else None
 
 
 def parse_day_blackout_periods(
@@ -112,94 +111,60 @@ class Settings:
 
     @staticmethod
     def _parse_children_from_env() -> dict[str, Child]:
-        children: dict[str, Child] = {}
-        child_index = 1
-        while phone := os.environ.get(f"CHILD_{child_index}_PHONE"):
-            ms_id = os.environ.get(f"CHILD_{child_index}_MS_ID", "").strip()
+        children = {}
+        for i in count(start=1):
+            phone = os.environ.get(f"CHILD_{i}_PHONE")
+            if phone is None:
+                break
+            ms_id = os.environ.get(f"CHILD_{i}_MS_ID", "").strip()
+            name = os.environ.get(f"CHILD_{i}_NAME", "").strip()
             if not ms_id:
-                raise ValueError(f"Missing required Microsoft child id: CHILD_{child_index}_MS_ID")
-            name = os.environ.get(f"CHILD_{child_index}_NAME", "").strip()
+                raise ValueError(f"Missing required Microsoft child id: CHILD_{i}_MS_ID")
             if not name:
-                raise ValueError(f"Missing required child name: CHILD_{child_index}_NAME")
-            children[phone] = Child(
-                phone_number=phone,
-                ms_account_id=ms_id,
-                name=name,
-            )
-            child_index += 1
+                raise ValueError(f"Missing required child name: CHILD_{i}_NAME")
+            children[phone] = Child(phone, ms_id, name)
         return children
 
     @staticmethod
     def _parse_blackout_periods_from_env() -> list[tuple[int, str, str]]:
-        blackout_periods: list[tuple[int, str, str]] = []
-        for weekday, suffix in enumerate(WEEKDAY_SUFFIXES):
-            day_periods = os.environ.get(f"BLACKOUT_PERIOD_{suffix}", "")
-            if not day_periods:
-                continue
-            blackout_periods.extend(
-                parse_day_blackout_periods(
-                    day_periods,
-                    weekday,
-                    source=f"BLACKOUT_PERIOD_{suffix}",
-                )
-            )
-        return blackout_periods
+        return [
+            period
+            for weekday, suffix in enumerate(WEEKDAY_SUFFIXES)
+            if (day_periods := os.environ.get(f"BLACKOUT_PERIOD_{suffix}", ""))
+            for period in parse_day_blackout_periods(day_periods, weekday, f"BLACKOUT_PERIOD_{suffix}")
+        ]
 
     @staticmethod
     def from_env() -> "Settings":
-        ms_family_email = os.environ.get("MS_FAMILY_EMAIL", "")
-        ms_family_password = os.environ.get("MS_FAMILY_PASSWORD", "")
-        
-        signal_group_id = os.environ.get("SIGNAL_GROUP_ID", "")
-        
-        signal_admins = Settings._parse_admins_from_env()
+        env = os.environ
         children = Settings._parse_children_from_env()
+        signal_admins = Settings._parse_admins_from_env()
+        signal_group_id = env.get("SIGNAL_GROUP_ID", "")
+
         if not signal_group_id:
             raise ValueError("Missing required SIGNAL_GROUP_ID")
         if not signal_admins:
             raise ValueError("At least one ADMIN_n_PHONE is required")
         if not children:
             raise ValueError("At least one child is required")
-        
-        # Time parameters are duration strings externally, minute-based internally.
-        weekly_addition_minutes = Settings._parse_duration_minutes(
-            os.environ.get("WEEKLY_ADDITION_TIME", "14h"),
-            "WEEKLY_ADDITION_TIME",
-        )
-        max_bank_minutes = Settings._parse_duration_minutes(
-            os.environ.get("MAX_BANK_TIME", "42h"),
-            "MAX_BANK_TIME",
-        )
-        # Note: accrued_playtime_max_minutes also serves as the max per request.
-        accrued_playtime_max_minutes = Settings._parse_duration_minutes(
-            os.environ.get("ACCRUED_PLAYTIME_MAX_TIME", os.environ.get("BREAK_BALANCE_MAX_TIME", "3h")),
-            "ACCRUED_PLAYTIME_MAX_TIME",
-        )
-        break_recovery_rate = float(os.environ.get("BREAK_RECOVERY_RATE", "3.0"))
-        
-        blackout_periods = Settings._parse_blackout_periods_from_env()
-        default_profile_name = normalize_profile_name(os.environ.get("RULE_PROFILE_DEFAULT_NAME", "default"))
-        default_rule_profile = RuleProfile(
-            name=default_profile_name,
-            weekly_addition_minutes=weekly_addition_minutes,
-            max_bank_minutes=max_bank_minutes,
-            accrued_playtime_max_minutes=accrued_playtime_max_minutes,
-            break_recovery_rate=break_recovery_rate,
-            blackout_periods=blackout_periods,
-        )
-        
-        timezone = os.environ.get("TZ", "Europe/Helsinki")
-        data_dir = os.environ.get("DATA_DIR", "./data")
-        bot_language = os.environ.get("BOT_LANGUAGE", "en")
 
+        # Duration strings are external; RuleProfile stores minutes.
         return Settings(
-            ms_family_email=ms_family_email,
-            ms_family_password=ms_family_password,
+            ms_family_email=env.get("MS_FAMILY_EMAIL", ""),
+            ms_family_password=env.get("MS_FAMILY_PASSWORD", ""),
             children=children,
             signal_admins=signal_admins,
             signal_group_id=signal_group_id,
-            default_rule_profile=default_rule_profile,
-            timezone=timezone,
-            data_dir=data_dir,
-            bot_language=bot_language,
+            default_rule_profile=RuleProfile(
+                name=normalize_profile_name(env.get("RULE_PROFILE_DEFAULT_NAME", "default")),
+                weekly_addition_minutes=Settings._parse_duration_minutes(env.get("WEEKLY_ADDITION_TIME", "14h"), "WEEKLY_ADDITION_TIME"),
+                max_bank_minutes=Settings._parse_duration_minutes(env.get("MAX_BANK_TIME", "42h"), "MAX_BANK_TIME"),
+                # This also caps a single playtime request.
+                accrued_playtime_max_minutes=Settings._parse_duration_minutes(env.get("ACCRUED_PLAYTIME_MAX_TIME", env.get("BREAK_BALANCE_MAX_TIME", "3h")), "ACCRUED_PLAYTIME_MAX_TIME"),
+                break_recovery_rate=float(env.get("BREAK_RECOVERY_RATE", "3.0")),
+                blackout_periods=Settings._parse_blackout_periods_from_env(),
+            ),
+            timezone=env.get("TZ", "Europe/Helsinki"),
+            data_dir=env.get("DATA_DIR", "./data"),
+            bot_language=env.get("BOT_LANGUAGE", "en"),
         )

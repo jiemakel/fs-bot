@@ -45,6 +45,14 @@ def test_parse_duration_minutes_rejects_multiplier_without_duration() -> None:
     assert parse_duration_minutes("3x") is None
 
 
+def test_parse_duration_minutes_rejects_trailing_text() -> None:
+    assert parse_duration_minutes("30m played guitar") is None
+
+
+def test_parse_duration_minutes_rejects_invalid_separator() -> None:
+    assert parse_duration_minutes("1h then 30m") is None
+
+
 def test_parse_activity_claim_basic() -> None:
     assert parse_activity_claim("30m played games") == 30
 

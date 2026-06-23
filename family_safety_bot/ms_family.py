@@ -487,19 +487,12 @@ class MicrosoftFamilyApi:
 
     @staticmethod
     def _extract_ppft(page_content: str, server_data: dict | None) -> str | None:
-        patterns = [
-            r'name=["\']PPFT["\'][^>]*value=["\']([^"\']+)["\']',
-            r'value=["\']([^"\']+)["\'][^>]*name=["\']PPFT["\']',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, page_content)
-            if match:
-                return match.group(1)
-
-        if server_data and isinstance(server_data.get("sFTTag"), str):
-            sft_tag_unescaped = unescape(server_data["sFTTag"])
-            match = re.search(r'name=["\']PPFT["\'][^>]*value=["\']([^"\']+)["\']', sft_tag_unescaped)
-            if match:
+        if match := re.search(r'name=["\']PPFT["\'][^>]*value=["\']([^"\']+)["\']', page_content):
+            return match.group(1)
+        if match := re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']PPFT["\']', page_content):
+            return match.group(1)
+        if server_data and isinstance(ppft := server_data.get("sFTTag"), str):
+            if match := re.search(r'name=["\']PPFT["\'][^>]*value=["\']([^"\']+)["\']', unescape(ppft)):
                 return match.group(1)
         return None
 
@@ -519,30 +512,22 @@ class MicrosoftFamilyApi:
 
     @staticmethod
     def _parse_auto_submit_form(html: str) -> tuple[str, str, dict[str, str]] | None:
-        for form_match in re.finditer(
-            r"<form(?P<attrs>[^>]*)>(?P<body>.*?)</form>",
-            html,
-            re.IGNORECASE | re.DOTALL,
-        ):
-            form_attrs = MicrosoftFamilyApi._parse_html_attributes(form_match.group("attrs"))
-            action = form_attrs.get("action")
-            if not action:
+        for form_match in re.finditer(r"<form(?P<attrs>[^>]*)>(?P<body>.*?)</form>", html, re.IGNORECASE | re.DOTALL):
+            attrs = MicrosoftFamilyApi._parse_html_attributes(form_match.group("attrs"))
+            if not (action := attrs.get("action")):
                 continue
-            method = form_attrs.get("method", "GET")
+            method = attrs.get("method", "GET")
             body = form_match.group("body")
-            fields: dict[str, str] = {}
-            hidden_fields = 0
+            fields = {}
+            hidden_count = 0
             for input_match in re.finditer(r"<input(?P<attrs>[^>]*)>", body, re.IGNORECASE):
-                attrs = MicrosoftFamilyApi._parse_html_attributes(input_match.group("attrs"))
-                field_name = attrs.get("name")
-                if field_name is None:
-                    continue
-                if attrs.get("type", "").lower() == "hidden":
-                    hidden_fields += 1
-                fields[field_name] = attrs.get("value", "")
-            if hidden_fields == 0:
-                continue
-            return (action, method, fields)
+                input_attrs = MicrosoftFamilyApi._parse_html_attributes(input_match.group("attrs"))
+                if field_name := input_attrs.get("name"):
+                    fields[field_name] = input_attrs.get("value", "")
+                    if input_attrs.get("type", "").lower() == "hidden":
+                        hidden_count += 1
+            if hidden_count > 0:
+                return (action, method, fields)
         return None
 
     @staticmethod

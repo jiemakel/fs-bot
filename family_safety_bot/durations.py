@@ -7,36 +7,27 @@ _DURATION_MULTIPLIER_RE = re.compile(r"^\+?(\d+)\s*x\s*(.+)$")
 
 
 def parse_duration_minutes(value: str) -> int | None:
-    """Parse duration text into minutes.
-
-    Supports decimal values and units h/m/min, including compound forms
-    like ``1h30m``, ``1h30min``, ``1h+30m``, and multiplier forms like
-    ``3x1h15m`` or ``3 x 1h 15 min``.
-    """
+    """Parse h/m/min durations, compounds, and multiplier prefixes into minutes."""
     text = value.strip().lower()
     if not text:
         return None
 
     multiplier = 1
-    multiplier_match = _DURATION_MULTIPLIER_RE.match(text)
-    if multiplier_match:
-        multiplier = int(multiplier_match.group(1))
-        text = multiplier_match.group(2).strip()
+    if match := _DURATION_MULTIPLIER_RE.match(text):
+        multiplier = int(match.group(1))
+        text = match.group(2).strip()
         if not text:
             return None
 
     total = 0.0
     pos = 0
     for match in _DURATION_TOKEN_RE.finditer(text):
-        sep = text[pos : match.start()]
-        if sep and sep.strip(" +"):
+        if (sep := text[pos : match.start()]) and sep.strip(" +"):
             return None
-        amount = float(match.group(1))
-        total += amount * 60 if match.group(2) == "h" else amount
+        total += float(match.group(1)) * (60 if match.group(2) == "h" else 1)
         pos = match.end()
 
-    trailing = text[pos:]
-    if pos == 0 or (trailing and trailing.strip(" +")):
+    if pos == 0 or ((trailing := text[pos:]) and trailing.strip(" +")):
         return None
     return int(round(total * multiplier))
 
@@ -63,16 +54,13 @@ def parse_activity_claim(text: str) -> int | None:
 
 
 def parse_signed_duration_minutes(value: str) -> int | None:
-    """Parse duration text with an optional leading sign.
-
-    Examples: ``30m``, ``30min``, ``+30m``, ``-1h``, ``=2h``.
-    """
+    """Parse duration text with an optional leading +, -, or = sign."""
     text = value.strip()
     if not text:
         return None
-
-    sign = -1 if text[0] == "-" else 1
+    sign = -1 if text.startswith("-") else 1
     if text[0] in "+-=":
         text = text[1:].strip()
-    minutes = parse_duration_minutes(text)
-    return None if minutes is None else sign * minutes
+    if (minutes := parse_duration_minutes(text)) is None:
+        return None
+    return sign * minutes
