@@ -376,6 +376,38 @@ def test_playtime_manager_recovery_completion_sends_group_notification(tmp_path:
     assert len(bot.sent) == 1
 
 
+def test_playtime_manager_scheduler_ticks_do_not_shrink_session_recovery_debt(tmp_path: Path) -> None:
+    manager, store = _build_manager(tmp_path)
+    rules = manager._rules_by_child[CHILD_PHONE]
+    start = datetime(2025, 1, 6, 10, 0, tzinfo=timezone.utc)
+    store.add_session(CHILD_PHONE, start, 180)
+    store.set_accrued_playtime(CHILD_PHONE, 0, start)
+
+    for tick in range(1, 184):
+        rules._get_local_now = lambda tick=tick: start + timedelta(seconds=59 * tick)  # type: ignore[method-assign]
+        asyncio.run(manager._check_recovery_completion())
+
+    bot = cast(FakeBot, manager.bot)
+    assert bot.sent == []
+    assert store.get_accrued_playtime(CHILD_PHONE)[0] == 0
+
+    rules._get_local_now = lambda: start + timedelta(minutes=180)  # type: ignore[method-assign]
+    asyncio.run(manager._check_recovery_completion())
+
+    assert len(bot.sent) == 1
+    assert store.get_accrued_playtime(CHILD_PHONE)[0] == 180
+
+    rules._get_local_now = lambda: start + timedelta(minutes=212)  # type: ignore[method-assign]
+    asyncio.run(manager._check_recovery_completion())
+    assert len(bot.sent) == 1
+
+    rules._get_local_now = lambda: start + timedelta(minutes=240)  # type: ignore[method-assign]
+    asyncio.run(manager._check_recovery_completion())
+
+    assert len(bot.sent) == 2
+    assert store.get_accrued_playtime(CHILD_PHONE)[0] == 0
+
+
 def test_playtime_manager_child_profile_switch_affects_limits(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import math
 from typing import Callable
 
 from dateutil import tz
@@ -89,7 +90,15 @@ class PlaytimeRules:
         return max(0, int((now - start_time).total_seconds() / 60))
 
     def _recovery_minutes(self, playtime_minutes: int, profile: RuleProfile) -> int:
-        return int(playtime_minutes / profile.break_recovery_rate)
+        return max(0, math.ceil((playtime_minutes / profile.break_recovery_rate) - 1e-9))
+
+    @staticmethod
+    def _active_play_overlap(active: ActiveSession, last_update: datetime, now: datetime) -> tuple[int, datetime]:
+        _session_id, start_time, minutes_granted = active
+        session_end = start_time + timedelta(minutes=minutes_granted)
+        play_end = min(now, session_end)
+        overlap_sec = (play_end - max(last_update, start_time)).total_seconds()
+        return (max(0, int(overlap_sec / 60)), play_end)
 
     def _current_week_start(self, now: datetime) -> datetime:
         return (now - timedelta(days=now.weekday())).replace(
@@ -132,7 +141,13 @@ class PlaytimeRules:
             pace_ratio=f"{pace_ratio:.2f}x",
         )
 
-    def _update_accrued_playtime(self, now: datetime, profile: RuleProfile) -> RecoveryCompletion | None:
+    def _update_accrued_playtime(
+        self,
+        now: datetime,
+        profile: RuleProfile,
+        *,
+        accrue_active: bool = True,
+    ) -> RecoveryCompletion | None:
         """Update accrued playtime and return completion details if recovery completed.
 
         Accrued playtime tracks consumed playtime:
@@ -149,30 +164,32 @@ class PlaytimeRules:
         if active := self._store.get_active_session(self._child_id):
             session_id, start_time, minutes_granted = active
             session_end = start_time + timedelta(minutes=minutes_granted)
+            if not accrue_active and now < session_end:
+                return None
             if now >= session_end:
                 # Expired sessions complete at their actual end, not at the later check time.
                 self._store.complete_session(session_id, session_end)
             # Count only the overlap between the elapsed window and the session.
-            if (overlap_sec := (min(now, session_end) - max(last_update, start_time)).total_seconds()) > 0:
-                play_minutes = overlap_sec / 60
-                play_end = min(now, session_end)
+            play_minutes, play_end = self._active_play_overlap(active, last_update, now)
 
         if play_minutes > 0:
             # New play resets rest accumulation; post-session rest starts fresh.
             new_debt = accrued_playtime + play_minutes
             new_rest = (now - play_end).total_seconds() / 60 if play_end < now else 0.0
         else:
-            new_debt = float(accrued_playtime)
-            new_rest = rest_accumulated + time_passed
+            new_debt = accrued_playtime
+            new_rest = rest_accumulated + time_passed if new_debt > 0 else 0.0
 
         recovery_completion = None
         # Recovery is granted only after the full rest period completes.
         if new_debt > 0 and (recovery_needed := new_debt / profile.break_recovery_rate) <= new_rest:
-            recovered = int(new_debt)
-            recovery_completion = RecoveryCompletion(self._recovery_minutes(recovered, profile), recovered)
+            recovery_completion = RecoveryCompletion(
+                self._recovery_minutes(new_debt, profile),
+                new_debt,
+            )
             new_debt = new_rest = 0.0
 
-        self._store.set_accrued_playtime(self._child_id, int(new_debt), now, new_rest)
+        self._store.set_accrued_playtime(self._child_id, new_debt, now, new_rest)
         return recovery_completion
 
     def _is_in_blackout_period(self, dt: datetime, profile: RuleProfile | None = None) -> tuple[bool, str]:
@@ -279,7 +296,7 @@ class PlaytimeRules:
         return max(0, accrued_playtime) + max(0, active_remaining)
 
     def _load_runtime_state(self, now: datetime, profile: RuleProfile) -> RuntimeState:
-        self._update_accrued_playtime(now, profile)
+        self._update_accrued_playtime(now, profile, accrue_active=False)
         active = self._store.get_active_session(self._child_id)
         if active:
             _session_id, start_time, minutes_granted = active
@@ -287,7 +304,11 @@ class PlaytimeRules:
         else:
             active_remaining = 0
         bank_balance = self._store.get_bank_balance(self._child_id)
-        accrued_playtime, _, rest_accumulated = self._store.get_accrued_playtime(self._child_id)
+        accrued_playtime, last_update, rest_accumulated = self._store.get_accrued_playtime(self._child_id)
+        if active:
+            # Include active elapsed time for decisions/status without making scheduler cadence affect stored debt.
+            accrued_playtime += self._active_play_overlap(active, last_update, now)[0]
+            rest_accumulated = 0.0
         return RuntimeState(
             bank_balance=bank_balance,
             weekly_bank_baseline=self._weekly_bank_baseline(now, bank_balance),
@@ -485,6 +506,7 @@ class PlaytimeRules:
             new_total_granted = current_granted + additional_minutes
             self._store.set_session_minutes_granted(session_id, new_total_granted)
         else:
+            self._store.set_accrued_playtime(self._child_id, state.accrued_playtime, now, 0.0)
             session_id = self._store.add_session(self._child_id, now, minutes)
 
         lines = [self._i18n.msg("rules.grant_confirm", minutes=format_duration(minutes))]
@@ -557,7 +579,8 @@ class PlaytimeRules:
             if 0 <= seconds_since_abort <= 60:
                 # Restore saved rest_accumulated so recovery continues as if uninterrupted.
                 current_playtime, _, _ = self._store.get_accrued_playtime(self._child_id)
-                self._store.set_accrued_playtime(self._child_id, current_playtime, now, saved_rest)
+                restored_playtime = current_playtime - int(seconds_since_abort / 60)
+                self._store.set_accrued_playtime(self._child_id, restored_playtime, now, saved_rest)
                 restored_rest_accumulated = saved_rest
             self._store.clear_recovery_abort(self._child_id)
         
@@ -573,12 +596,12 @@ class PlaytimeRules:
         return message
 
     def has_active_session(self) -> bool:
-        self._update_accrued_playtime(self._get_local_now(), self._profile())
+        self._update_accrued_playtime(self._get_local_now(), self._profile(), accrue_active=False)
         return self._store.get_active_session(self._child_id) is not None
 
     def check_recovery_completion(self) -> str | None:
         """Update recovery state and return a one-shot completion message if recovery finished."""
-        recovery = self._update_accrued_playtime(self._get_local_now(), self._profile())
+        recovery = self._update_accrued_playtime(self._get_local_now(), self._profile(), accrue_active=False)
         if recovery is None:
             return None
         return self._i18n.msg(
