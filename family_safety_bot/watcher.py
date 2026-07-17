@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import sqlite3
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 import httpx
@@ -16,7 +16,6 @@ from family_safety_bot.config import (
     RuleProfile,
     Settings,
     WEEKDAY_SUFFIXES,
-    normalize_profile_name,
     parse_rule_profile_definition,
 )
 from family_safety_bot.durations import parse_activity_claim, parse_duration_minutes, parse_signed_duration_minutes
@@ -77,7 +76,6 @@ class PlaytimeManager(Command):
         }
         self._ms_api: MicrosoftFamilyApi | None = None
         self._ms_api_lock = asyncio.Lock()
-        self._default_profile = settings.default_rule_profile
         self._profiles_by_name: dict[str, RuleProfile] = {}
         self._active_profile_name_by_child: dict[str, str] = {}
         self._initialize_profiles()
@@ -106,11 +104,6 @@ class PlaytimeManager(Command):
     def _initialize_profiles(self) -> None:
         existing = self._store.list_rule_profiles()
         self._profiles_by_name = {profile.name.lower(): profile for profile in existing}
-        if self._default_profile is not None:
-            default_key = self._default_profile.name.lower()
-            if default_key not in self._profiles_by_name:
-                self._profiles_by_name[default_key] = self._default_profile
-                self._store.upsert_rule_profile(self._default_profile)
 
         self._active_profile_name_by_child = {}
         for child_id in self._settings.children:
@@ -120,14 +113,12 @@ class PlaytimeManager(Command):
 
     def _profile_for_child(self, phone_number: str) -> RuleProfile:
         active_name = self._active_profile_name_by_child.get(phone_number)
-        if active_name is None and self._default_profile is not None:
-            active_name = self._default_profile.name
         if active_name is None:
             raise RuntimeError(f"No rule profile assigned to {phone_number}")
         return self._profiles_by_name[active_name.lower()]
 
     def _has_profile(self, phone_number: str) -> bool:
-        return phone_number in self._active_profile_name_by_child or self._default_profile is not None
+        return phone_number in self._active_profile_name_by_child
     
     async def _resolve_child(
         self,
@@ -202,10 +193,15 @@ class PlaytimeManager(Command):
         )
         bank_lines = "\n".join(
             self._i18n.msg(
-                "watcher.profile_summary_bank",
+                "watcher.profile_summary_recovery_bank" if bank.is_recovery else "watcher.profile_summary_bank",
                 bank_name=bank.name,
-                weekly_addition=format_duration(bank.weekly_addition_minutes),
+                weekly_addition=(
+                    format_duration(bank.weekly_addition_minutes)
+                    if bank.weekly_addition_minutes is not None
+                    else ""
+                ),
                 max_balance=format_duration(bank.max_balance_minutes),
+                recovery_rate=f"{bank.recovery_rate:g}" if bank.recovery_rate is not None else "",
             )
             for bank in profile.banks.values()
         )
@@ -213,8 +209,6 @@ class PlaytimeManager(Command):
             "watcher.profile_summary",
             name=profile.name,
             banks=bank_lines,
-            accrued_max=format_duration(profile.accrued_playtime_max_minutes),
-            break_recovery_rate=f"{profile.break_recovery_rate:.2f}",
             blackouts=blackout_lines,
         )
 
@@ -284,25 +278,20 @@ class PlaytimeManager(Command):
             await ctx.send(self._i18n.msg("watcher.profile_usage"))
             return
         try:
-            name = normalize_profile_name(parts[1])
-        except ValueError:
-            await ctx.send(self._i18n.msg("watcher.profile_invalid"))
-            return
-        try:
             definition = json.loads(parts[2])
-            created = parse_rule_profile_definition(name, definition)
+            created = parse_rule_profile_definition(parts[1], definition)
         except (json.JSONDecodeError, ValueError):
             await ctx.send(self._i18n.msg("watcher.profile_invalid"))
             return
         try:
             self._store.upsert_rule_profile(created)
         except sqlite3.Error:
-            logger.exception("Failed to save rule profile %s", name)
-            await ctx.send(self._i18n.msg("watcher.profile_save_failed", profile_name=name))
+            logger.exception("Failed to save rule profile %s", created.name)
+            await ctx.send(self._i18n.msg("watcher.profile_save_failed", profile_name=created.name))
             return
-        self._profiles_by_name[name.lower()] = created
+        self._profiles_by_name[created.name.lower()] = created
         await ctx.send(
-            self._i18n.msg("watcher.profile_defined", profile_name=name)
+            self._i18n.msg("watcher.profile_defined", profile_name=created.name)
             + "\n"
             + self._profile_summary(created)
         )
@@ -499,13 +488,13 @@ class PlaytimeManager(Command):
         logger.info("Scheduled weekly rollover check for Monday 00:01")
 
         self.bot.scheduler.add_job(  # type: ignore[union-attr]
-            self._check_recovery_completion,
+            self._check_automatic_updates,
             trigger="interval",
             minutes=1,
             timezone=self._settings.timezone,
             max_instances=1,
         )
-        logger.info("Scheduled recovery completion check every minute")
+        logger.info("Scheduled session and recovery-bank checks every minute")
 
     async def handle(self, context: Context) -> None:
         """Handle incoming messages from the group."""
@@ -533,11 +522,8 @@ class PlaytimeManager(Command):
             return
 
         if message_lower in self._commands["status"]:
-            child_sections = [
-                self._format_child_status_section(phone, child_obj)
-                for phone, child_obj in self._settings.children.items()
-            ]
-            await context.send("\n\n".join(child_sections))
+            for phone, child_obj in self._settings.children.items():
+                await context.send(self._format_child_status_section(phone, child_obj))
             return
 
         parsed_minutes = parse_duration_minutes(message_text)
@@ -763,35 +749,14 @@ class PlaytimeManager(Command):
         except Exception:
             logger.exception("Failed to send rollover notification to group")
 
-    async def _check_recovery_completion(self) -> None:
-        """Scheduled task to notify when accrued playtime recovery finishes or playtime finishes naturally."""
+    async def _check_automatic_updates(self) -> None:
+        """Notify when sessions finish naturally or recovery banks refill."""
         results = []
         for phone, child in self._settings.children.items():
             rules = self._rules_by_child[phone]
             if not self._has_profile(phone):
                 continue
-            local_now = rules._get_local_now()
-            
-            # Check if active session has expired naturally
-            active = self._store.get_active_session(child.phone_number)
-            session_finished_message = None
-            if active:
-                session_id, start_time, minutes_granted = active
-                session_end = start_time + timedelta(minutes=minutes_granted)
-                if local_now >= session_end:
-                    session_finished_message = self._i18n.msg(
-                        "rules.session_completed",
-                        minutes=format_duration(minutes_granted),
-                    )
-            
-            recovery_message = rules.check_recovery_completion()
-            
-            child_msgs = []
-            if session_finished_message:
-                child_msgs.append(session_finished_message)
-            if recovery_message:
-                child_msgs.append(recovery_message)
-                
+            child_msgs = rules.check_automatic_updates()
             if child_msgs:
                 results.append(f"[{child.name}]\n" + "\n".join(child_msgs))
 

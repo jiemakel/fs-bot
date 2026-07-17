@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -16,16 +16,24 @@ CHILD = Child(
 )
 
 
+@dataclass(frozen=True)
+class FixtureSettings(Settings):
+    """Settings plus the explicit profile used by rules-focused tests."""
+
+    default_rule_profile: RuleProfile | None = None
+
+
 def build_store(tmp_path: Path) -> PlaytimeStore:
     return PlaytimeStore(str(tmp_path / "test_playtime.db"))
 
 
-def build_settings(tmp_path: Path, **overrides: Any) -> Settings:
+def build_settings(tmp_path: Path, **overrides: Any) -> FixtureSettings:
     default_profile = RuleProfile(
         name="default",
-        banks={"default": BankProfile("default", 840, 2520)},
-        accrued_playtime_max_minutes=180,
-        break_recovery_rate=3.0,
+        banks={
+            "default": BankProfile("default", 840, 2520),
+            "recovery": BankProfile("recovery", None, 180, 3.0),
+        },
         blackout_periods=[],
     )
     values = {
@@ -42,8 +50,6 @@ def build_settings(tmp_path: Path, **overrides: Any) -> Settings:
         key: overrides.pop(key)
         for key in (
             "banks",
-            "accrued_playtime_max_minutes",
-            "break_recovery_rate",
             "blackout_periods",
         )
         if key in overrides
@@ -52,4 +58,4 @@ def build_settings(tmp_path: Path, **overrides: Any) -> Settings:
         default_profile = replace(default_profile, **profile_updates)
     values["default_rule_profile"] = default_profile
     values.update(overrides)
-    return Settings(**values)
+    return FixtureSettings(**values)

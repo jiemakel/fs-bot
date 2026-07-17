@@ -29,7 +29,7 @@ class ActivityClaim:
 
 
 class PlaytimeStore:
-    """Store playtime usage, sessions, accrued playtime, and recovery tracking."""
+    """Store playtime banks, sessions, profiles, and activity claims."""
     
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
@@ -46,13 +46,8 @@ class PlaytimeStore:
                 child_id TEXT NOT NULL,
                 bank_name TEXT NOT NULL,
                 balance_minutes INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (child_id, bank_name)
-            );
-            CREATE TABLE IF NOT EXISTS accrued_playtime (
-                child_id TEXT PRIMARY KEY,
-                playtime_minutes INTEGER NOT NULL DEFAULT 0,
                 last_update_iso TEXT NOT NULL,
-                rest_accumulated_minutes REAL NOT NULL DEFAULT 0.0
+                PRIMARY KEY (child_id, bank_name)
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,8 +66,6 @@ class PlaytimeStore:
             CREATE TABLE IF NOT EXISTS rule_profiles (
                 profile_name TEXT PRIMARY KEY,
                 banks_json TEXT NOT NULL,
-                accrued_playtime_max_minutes INTEGER NOT NULL,
-                break_recovery_rate REAL NOT NULL,
                 blackout_periods_json TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS app_state (
@@ -97,11 +90,8 @@ class PlaytimeStore:
         sql: str,
         params: tuple = (),
         commit: bool = False,
-        child_id: str | None = None,
     ) -> sqlite3.Cursor:
         with sqlite3.connect(self._db_path) as conn:
-            if child_id is not None:
-                self._ensure_child_in_conn(conn, child_id)
             cursor = conn.execute(sql, params)
             if commit:
                 conn.commit()
@@ -114,14 +104,9 @@ class PlaytimeStore:
 
     @staticmethod
     def _deserialize_blackout_periods(raw: str) -> list[tuple[int, str, str]]:
-        try:
-            loaded = json.loads(raw)
-        except json.JSONDecodeError:
-            return []
         return [
-            (int(item[0]), str(item[1]), str(item[2]))
-            for item in (loaded if isinstance(loaded, list) else [])
-            if isinstance(item, (list, tuple)) and len(item) >= 3
+            (int(weekday), str(start_time), str(end_time))
+            for weekday, start_time, end_time in json.loads(raw)
         ]
 
     @staticmethod
@@ -132,6 +117,7 @@ class PlaytimeStore:
                     "name": bank.name,
                     "weekly_addition_minutes": bank.weekly_addition_minutes,
                     "max_balance_minutes": bank.max_balance_minutes,
+                    "recovery_rate": bank.recovery_rate,
                 }
                 for bank in banks.values()
             ],
@@ -144,8 +130,11 @@ class PlaytimeStore:
         return {
             str(item["name"]).lower(): BankProfile(
                 name=str(item["name"]),
-                weekly_addition_minutes=int(item["weekly_addition_minutes"]),
+                weekly_addition_minutes=(
+                    None if item["weekly_addition_minutes"] is None else int(item["weekly_addition_minutes"])
+                ),
                 max_balance_minutes=int(item["max_balance_minutes"]),
+                recovery_rate=None if item["recovery_rate"] is None else float(item["recovery_rate"]),
             )
             for item in loaded
         }
@@ -155,9 +144,7 @@ class PlaytimeStore:
         return RuleProfile(
             name=row[0],
             banks=cls._deserialize_banks(row[1]),
-            accrued_playtime_max_minutes=row[2],
-            break_recovery_rate=row[3],
-            blackout_periods=cls._deserialize_blackout_periods(row[4]),
+            blackout_periods=cls._deserialize_blackout_periods(row[2]),
         )
 
     def _set_app_state(self, key: str, value: str) -> None:
@@ -178,42 +165,45 @@ class PlaytimeStore:
         ).fetchone()
         return None if row is None else row[0]
 
-    def _ensure_child_in_conn(self, conn: sqlite3.Connection, child_id: str) -> None:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO accrued_playtime (child_id, playtime_minutes, last_update_iso)
-            VALUES (?, 0, datetime('now'));
-            """,
-            (child_id,),
-        )
-
-    def get_bank_balance(self, child_id: str, bank_name: str = "default") -> int:
-        """Get one named bank balance for a child, creating it at zero if needed."""
+    def get_bank_state(
+        self,
+        child_id: str,
+        bank_name: str,
+        initial_balance: int = 0,
+        now: datetime | None = None,
+    ) -> tuple[int, datetime]:
+        """Return balance and update time, creating the bank when absent."""
+        update_time = now or datetime.now(timezone.utc)
         self._execute(
-            "INSERT OR IGNORE INTO bank (child_id, bank_name, balance_minutes) VALUES (?, ?, 0);",
-            (child_id, bank_name.lower()),
+            """INSERT OR IGNORE INTO bank (child_id, bank_name, balance_minutes, last_update_iso)
+               VALUES (?, ?, ?, ?);""",
+            (child_id, bank_name.lower(), initial_balance, update_time.isoformat()),
             commit=True,
-            child_id=child_id,
         )
         row = self._execute(
-            "SELECT balance_minutes FROM bank WHERE child_id = ? AND bank_name = ?;",
+            "SELECT balance_minutes, last_update_iso FROM bank WHERE child_id = ? AND bank_name = ?;",
             (child_id, bank_name.lower()),
-            child_id=child_id,
         ).fetchone()
         assert row is not None
-        return row[0]
+        return row[0], _parse_stored_datetime(row[1])
 
-    def get_bank_balances(self, child_id: str, bank_names: list[str]) -> dict[str, int]:
-        return {name.lower(): self.get_bank_balance(child_id, name) for name in bank_names}
+    def get_bank_balance(self, child_id: str, bank_name: str = "default") -> int:
+        return self.get_bank_state(child_id, bank_name)[0]
 
-    def set_bank_balance(self, child_id: str, balance_minutes: int, bank_name: str = "default") -> None:
+    def set_bank_balance(
+        self,
+        child_id: str,
+        balance_minutes: int,
+        bank_name: str = "default",
+        update_time: datetime | None = None,
+    ) -> None:
         """Set one named bank balance for a child."""
-        self.get_bank_balance(child_id, bank_name)
+        changed_at = update_time or datetime.now(timezone.utc)
+        self.get_bank_state(child_id, bank_name, now=changed_at)
         self._execute(
-            "UPDATE bank SET balance_minutes = ? WHERE child_id = ? AND bank_name = ?;",
-            (balance_minutes, child_id, bank_name.lower()),
+            "UPDATE bank SET balance_minutes = ?, last_update_iso = ? WHERE child_id = ? AND bank_name = ?;",
+            (balance_minutes, changed_at.isoformat(), child_id, bank_name.lower()),
             commit=True,
-            child_id=child_id,
         )
 
     def add_to_bank(self, child_id: str, minutes: int, max_balance: int, bank_name: str = "default") -> int:
@@ -224,29 +214,6 @@ class PlaytimeStore:
         self.set_bank_balance(child_id, new_balance, bank_name)
         return actual_added
 
-    def get_accrued_playtime(self, child_id: str) -> tuple[int, datetime, float]:
-        """Get (accrued_playtime_minutes, last_update_time, rest_accumulated_minutes) for a child."""
-        row = self._execute(
-            "SELECT playtime_minutes, last_update_iso, rest_accumulated_minutes FROM accrued_playtime WHERE child_id = ?;",
-            (child_id,),
-            child_id=child_id,
-        ).fetchone()
-        assert row is not None
-        return (row[0], _parse_stored_datetime(row[1]), row[2])
-
-    def set_accrued_playtime(self, child_id: str, playtime_minutes: int, update_time: datetime, rest_accumulated_minutes: float = 0.0) -> None:
-        """Set accrued playtime and last update time for a child."""
-        self._execute(
-            """
-            UPDATE accrued_playtime
-            SET playtime_minutes = ?, last_update_iso = ?, rest_accumulated_minutes = ?
-            WHERE child_id = ?;
-            """,
-            (max(0, playtime_minutes), update_time.isoformat(), max(0.0, rest_accumulated_minutes), child_id),
-            commit=True,
-            child_id=child_id,
-        )
-
     def add_session(self, child_id: str, start_time: datetime, minutes_granted: int) -> int:
         """Record a new playtime session for a child. Returns session_id."""
         cursor = self._execute(
@@ -256,7 +223,6 @@ class PlaytimeStore:
             """,
             (child_id, start_time.isoformat(), minutes_granted),
             commit=True,
-            child_id=child_id,
         )
         return cursor.lastrowid  # type: ignore
 
@@ -314,7 +280,6 @@ class PlaytimeStore:
             LIMIT 1;
             """,
             (child_id,),
-            child_id=child_id,
         ).fetchone()
 
         if row is None:
@@ -328,22 +293,16 @@ class PlaytimeStore:
             INSERT INTO rule_profiles (
                 profile_name,
                 banks_json,
-                accrued_playtime_max_minutes,
-                break_recovery_rate,
                 blackout_periods_json
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?)
             ON CONFLICT(profile_name) DO UPDATE SET
                 banks_json = excluded.banks_json,
-                accrued_playtime_max_minutes = excluded.accrued_playtime_max_minutes,
-                break_recovery_rate = excluded.break_recovery_rate,
                 blackout_periods_json = excluded.blackout_periods_json;
             """,
             (
                 profile.name,
                 self._serialize_banks(profile.banks),
-                profile.accrued_playtime_max_minutes,
-                profile.break_recovery_rate,
                 self._serialize_blackout_periods(profile.blackout_periods),
             ),
             commit=True,
@@ -355,8 +314,6 @@ class PlaytimeStore:
             SELECT
                 profile_name,
                 banks_json,
-                accrued_playtime_max_minutes,
-                break_recovery_rate,
                 blackout_periods_json
             FROM rule_profiles
             ORDER BY profile_name;
@@ -376,21 +333,37 @@ class PlaytimeStore:
     def is_child_block_mode_enabled(self, child_id: str) -> bool:
         return self._get_app_state(f"grant_block_mode:{child_id}") == "1"
 
-    def set_recovery_abort(self, child_id: str, saved_rest: float, abort_time: datetime) -> None:
-        """Record that recovery was aborted mid-period."""
-        self._set_app_state(f"recovery_abort:{child_id}", f"{saved_rest}|{abort_time.isoformat()}")
+    def set_recovery_interruption(
+        self,
+        child_id: str,
+        recovery_started_by_bank: dict[str, datetime],
+        interrupted_at: datetime,
+    ) -> None:
+        value = json.dumps(
+            {
+                "recovery_started": {
+                    bank_name.lower(): started.isoformat()
+                    for bank_name, started in recovery_started_by_bank.items()
+                },
+                "interrupted_at": interrupted_at.isoformat(),
+            },
+            separators=(",", ":"),
+        )
+        self._set_app_state(f"recovery_interruption:{child_id}", value)
 
-    def get_recovery_abort(self, child_id: str) -> tuple[float, datetime] | None:
-        """Return (saved_rest, abort_time) if a recovery abort is recorded, else None."""
-        raw = self._get_app_state(f"recovery_abort:{child_id}")
+    def get_recovery_interruption(self, child_id: str) -> tuple[dict[str, datetime], datetime] | None:
+        raw = self._get_app_state(f"recovery_interruption:{child_id}")
         if not raw:
             return None
-        saved_rest, abort_time_iso = raw.split("|", 1)
-        return (float(saved_rest), _parse_stored_datetime(abort_time_iso))
+        loaded = json.loads(raw)
+        starts = {
+            str(bank_name): _parse_stored_datetime(started)
+            for bank_name, started in loaded["recovery_started"].items()
+        }
+        return starts, _parse_stored_datetime(loaded["interrupted_at"])
 
-    def clear_recovery_abort(self, child_id: str) -> None:
-        """Remove any recorded recovery abort for a child."""
-        self._set_app_state(f"recovery_abort:{child_id}", "")
+    def clear_recovery_interruption(self, child_id: str) -> None:
+        self._set_app_state(f"recovery_interruption:{child_id}", "")
 
     def add_activity_claim(
         self,

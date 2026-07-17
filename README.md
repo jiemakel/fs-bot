@@ -4,7 +4,7 @@ Signal group bot for managing children’s playtime with rule-based decisions an
 
 ## Overview
 
-The bot is built around a research-informed playtime economy. Profiles define one or more named time banks with independent weekly additions and maximum balances. A child needs enough time in every bank to play. Activity rewards go to the profile's first bank, allowing setups such as a long-term earned-time bank combined with a weekly allowance bank.
+The bot is built around a research-informed playtime economy. Profiles define named time banks with maximum balances and either weekly additions or automatic recovery after a completed break. A child needs enough time in every bank to play. Activity rewards go to the profile's first bank.
 
 To keep play sessions balanced, the bot enforces a cap on the maximum length of continuous play. After reaching the continuous-play limit, a child needs to take a break before earning more playtime. Configurable blackout periods can create daily no-play windows, full rest days, or a predictable rhythm for when playtime is available.
 
@@ -78,10 +78,9 @@ Then define and assign a profile in Signal. This example recreates a long-term e
 profile define normal {
   "banks": {
     "earned": {"weekly_addition": "14h", "max_balance": "42h"},
-    "weekly": {"weekly_addition": "30h", "max_balance": "30h"}
+    "weekly": {"weekly_addition": "30h", "max_balance": "30h"},
+    "recovery": {"recovery_rate": 3.0, "max_balance": "3h"}
   },
-  "accrued_playtime_max": "3h",
-  "break_recovery_rate": 3.0,
   "blackouts": [
     {"days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"], "start": "00:00", "end": "08:00"},
     {"days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"], "start": "20:30", "end": "24:00"}

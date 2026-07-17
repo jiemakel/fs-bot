@@ -78,13 +78,11 @@ def test_playtime_rules_upcoming_blackout_next_day_caps_grant(tmp_path: Path) ->
 def test_playtime_rules_partial_grant_applies_active_limiters(tmp_path: Path) -> None:
     rules = _build_rules(
         tmp_path,
-        accrued_playtime_max_minutes=40,
         blackout_periods=[(0, "21:00", "24:00")],
     )
     now = datetime(2025, 1, 6, 20, 30, tzinfo=timezone.utc)
     rules._get_local_now = lambda: now  # type: ignore[method-assign]
     rules._store.set_bank_balance(CHILD_PHONE, 20)
-    rules._store.set_accrued_playtime(CHILD_PHONE, 10, now)
 
     decision = rules.evaluate_request(60)
     assert decision.allowed is True
@@ -106,6 +104,7 @@ def test_playtime_rules_basic_request(tmp_path: Path) -> None:
     assert session_id > 0
 
     assert store.get_bank_balance(CHILD_PHONE) == 240
+    assert store.get_bank_balance(CHILD_PHONE, "recovery") == 120
     active = store.get_active_session(CHILD_PHONE)
     assert active is not None
     assert active[0] == session_id
@@ -132,7 +131,6 @@ def test_playtime_rules_secondary_bank_caps_grants(tmp_path: Path) -> None:
             "default": BankProfile("default", 180, 300),
             "weekly": BankProfile("weekly", 90, 90),
         },
-        accrued_playtime_max_minutes=300,
     )
     rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
     now = datetime(2025, 1, 8, 12, 0, tzinfo=timezone.utc)
@@ -155,7 +153,6 @@ def test_playtime_rules_ending_early_refunds_every_bank(tmp_path: Path) -> None:
             "default": BankProfile("default", 180, 300),
             "weekly": BankProfile("weekly", 90, 90),
         },
-        accrued_playtime_max_minutes=300,
     )
     rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
     start = datetime(2025, 1, 8, 12, 0, tzinfo=timezone.utc)
@@ -173,27 +170,6 @@ def test_playtime_rules_ending_early_refunds_every_bank(tmp_path: Path) -> None:
     assert store.get_bank_balance(CHILD_PHONE, "weekly") == 60
 
 
-def test_playtime_rules_accrued_playtime_maxed(tmp_path: Path) -> None:
-    store = build_store(tmp_path)
-    settings = build_settings(tmp_path)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
-
-    now = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
-    rules._get_local_now = lambda: now  # type: ignore[method-assign]
-    store.set_bank_balance(CHILD_PHONE, 500)
-    session_id = store.add_session(CHILD_PHONE, now - timedelta(minutes=10), 180)
-    store.set_accrued_playtime(CHILD_PHONE, 180, now)
-
-    decision = rules.evaluate_request(60)
-    assert decision.allowed is False
-    assert decision.minutes_granted == 0
-
-    store.complete_session(session_id, now)
-    rules._get_local_now = lambda: now + timedelta(minutes=1)  # type: ignore[method-assign]
-    decision2 = rules.evaluate_request(60)
-    assert decision2.minutes_granted <= 3
-
-
 def test_playtime_rules_blackout_full_day_period(tmp_path: Path) -> None:
     rules = _build_rules(tmp_path, blackout_periods=[(0, "00:00", "24:00"), (1, "00:00", "24:00")])
 
@@ -202,170 +178,96 @@ def test_playtime_rules_blackout_full_day_period(tmp_path: Path) -> None:
     assert is_blackout is True
 
 
-def test_playtime_rules_accrued_playtime_recovery(tmp_path: Path) -> None:
-    """Recovery is only granted at end of a full rest period (all-or-nothing)."""
+def test_recovery_bank_refills_only_after_complete_break(tmp_path: Path) -> None:
     store = build_store(tmp_path)
-    settings = build_settings(tmp_path)  # break_recovery_rate=3.0
+    settings = build_settings(tmp_path)
     rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
-
     store.set_bank_balance(CHILD_PHONE, 300)
-
-    # 90 min debt requires 90/3 = 30 min rest.
     base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
-    store.set_accrued_playtime(CHILD_PHONE, 90, base)
+    store.set_bank_balance(CHILD_PHONE, 90, "recovery", base)
 
-    # After 20 min of rest (< 30 min needed): no recovery yet.
     rules._get_local_now = lambda: base + timedelta(minutes=20)  # type: ignore[method-assign]
     rules.evaluate_request(60)
-    balance, _, rest_acc = store.get_accrued_playtime(CHILD_PHONE)
-    assert balance == 90
-    assert int(rest_acc) == 20
+    assert store.get_bank_balance(CHILD_PHONE, "recovery") == 90
 
-    # After 30 min of rest (full period complete): debt cleared.
     rules._get_local_now = lambda: base + timedelta(minutes=30)  # type: ignore[method-assign]
     rules.evaluate_request(60)
-    balance, _, rest_acc = store.get_accrued_playtime(CHILD_PHONE)
-    assert balance == 0
-    assert rest_acc == 0.0
+    assert store.get_bank_balance(CHILD_PHONE, "recovery") == 180
 
 
-def test_playtime_rules_recovery_completion_message_is_one_shot(tmp_path: Path) -> None:
+def test_natural_session_end_starts_recovery_bank_break(tmp_path: Path) -> None:
     store = build_store(tmp_path)
-    settings = build_settings(tmp_path, break_recovery_rate=3.0)
+    settings = build_settings(tmp_path)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    start = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
+    rules._get_local_now = lambda: start  # type: ignore[method-assign]
+    store.set_bank_balance(CHILD_PHONE, 300)
+    rules.grant_playtime(60)
+
+    rules._get_local_now = lambda: start + timedelta(minutes=79)  # type: ignore[method-assign]
+    rules.check_automatic_updates()
+    assert store.get_bank_balance(CHILD_PHONE, "recovery") == 120
+
+    rules._get_local_now = lambda: start + timedelta(minutes=80)  # type: ignore[method-assign]
+    rules.check_automatic_updates()
+    assert store.get_bank_balance(CHILD_PHONE, "recovery") == 180
+
+
+def test_recovery_bank_completion_notification_is_one_shot(tmp_path: Path) -> None:
+    store = build_store(tmp_path)
+    settings = build_settings(tmp_path)
     i18n = RecordingI18n()
     rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile, i18n=i18n)  # type: ignore[arg-type]
-
     base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
-    store.set_accrued_playtime(CHILD_PHONE, 90, base)
+    store.set_bank_balance(CHILD_PHONE, 90, "recovery", base)
     rules._get_local_now = lambda: base + timedelta(minutes=30)  # type: ignore[method-assign]
 
-    message = rules.check_recovery_completion()
-
-    assert message is not None
-    balance, _, rest_acc = store.get_accrued_playtime(CHILD_PHONE)
-    assert balance == 0
-    assert rest_acc == 0.0
-    assert rules.check_recovery_completion() is None
-    recovery_calls = [kwargs for key, kwargs in i18n.calls if key == "rules.recovery_completed"]
-    assert len(recovery_calls) == 1
-    assert set(recovery_calls[0]) == {"recovery", "accrued_playtime"}
-    assert recovery_calls[0]["recovery"] != recovery_calls[0]["accrued_playtime"]
+    assert len(rules.check_automatic_updates()) == 1
+    assert rules.check_automatic_updates() == []
 
 
-def test_playtime_rules_recovery_abort_can_be_resumed_by_quick_stop(tmp_path: Path) -> None:
+def test_recovery_break_progress_is_restored_after_quick_stop(tmp_path: Path) -> None:
     store = build_store(tmp_path)
-    settings = build_settings(tmp_path, break_recovery_rate=3.0)
+    settings = build_settings(tmp_path)
     rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
-
     base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
     grant_at = base + timedelta(minutes=20)
     stop_at = grant_at + timedelta(seconds=30)
     store.set_bank_balance(CHILD_PHONE, 300)
-    store.set_accrued_playtime(CHILD_PHONE, 90, base)
+    store.set_bank_balance(CHILD_PHONE, 90, "recovery", base)
 
     rules._get_local_now = lambda: grant_at  # type: ignore[method-assign]
-    session_id, _grant_message = rules.grant_playtime(10)
-
-    assert session_id > 0
-    abort = store.get_recovery_abort(CHILD_PHONE)
-    assert abort is not None
-    saved_rest, abort_time = abort
-    assert int(saved_rest) == 20
-    assert abort_time == grant_at
+    rules.grant_playtime(10)
+    assert store.get_recovery_interruption(CHILD_PHONE) is not None
 
     rules._get_local_now = lambda: stop_at  # type: ignore[method-assign]
     rules.complete_session()
-
-    assert store.get_recovery_abort(CHILD_PHONE) is None
-    balance, last_update, rest_acc = store.get_accrued_playtime(CHILD_PHONE)
+    balance, recovery_started = store.get_bank_state(CHILD_PHONE, "recovery")
     assert balance == 90
-    assert last_update == stop_at
-    assert int(rest_acc) == 20
+    assert recovery_started == base
 
     rules._get_local_now = lambda: stop_at + timedelta(minutes=10)  # type: ignore[method-assign]
     rules.evaluate_request(1)
-
-    balance, _, rest_acc = store.get_accrued_playtime(CHILD_PHONE)
-    assert balance == 0
-    assert rest_acc == 0.0
+    assert store.get_bank_balance(CHILD_PHONE, "recovery") == 180
 
 
-def test_playtime_rules_recovery_abort_expired_grace_does_not_restore_rest(tmp_path: Path) -> None:
+def test_recovery_break_progress_resets_after_grace_expires(tmp_path: Path) -> None:
     store = build_store(tmp_path)
-    settings = build_settings(tmp_path, break_recovery_rate=3.0)
+    settings = build_settings(tmp_path)
     rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
-
     base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
     grant_at = base + timedelta(minutes=20)
     stop_at = grant_at + timedelta(minutes=2)
     store.set_bank_balance(CHILD_PHONE, 300)
-    store.set_accrued_playtime(CHILD_PHONE, 90, base)
+    store.set_bank_balance(CHILD_PHONE, 90, "recovery", base)
 
     rules._get_local_now = lambda: grant_at  # type: ignore[method-assign]
     rules.grant_playtime(10)
-    assert store.get_recovery_abort(CHILD_PHONE) is not None
-
     rules._get_local_now = lambda: stop_at  # type: ignore[method-assign]
     rules.complete_session()
-
-    assert store.get_recovery_abort(CHILD_PHONE) is None
-    balance, last_update, rest_acc = store.get_accrued_playtime(CHILD_PHONE)
-    assert balance == 92
-    assert last_update == stop_at
-    assert rest_acc == 0.0
-
-
-def test_playtime_rules_natural_session_end_starts_break_recovery(tmp_path: Path) -> None:
-    store = build_store(tmp_path)
-    settings = build_settings(tmp_path)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
-
-    start = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
-    store.add_session(CHILD_PHONE, start, 60)
-    store.set_accrued_playtime(CHILD_PHONE, 0, start)
-
-    now = start + timedelta(minutes=90)
-    rules._get_local_now = lambda: now  # type: ignore[method-assign]
-
-    assert rules.has_active_session() is False
-    balance, _, _rest = store.get_accrued_playtime(CHILD_PHONE)
-    assert balance == 0
-
-
-def test_playtime_rules_scheduler_ticks_do_not_persist_active_session_accrual(tmp_path: Path) -> None:
-    store = build_store(tmp_path)
-    settings = build_settings(tmp_path)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
-
-    start = datetime(2025, 1, 6, 10, 0, tzinfo=timezone.utc)
-    store.add_session(CHILD_PHONE, start, 180)
-    store.set_accrued_playtime(CHILD_PHONE, 0, start)
-
-    for tick in range(1, 184):
-        rules._get_local_now = lambda tick=tick: start + timedelta(seconds=59 * tick)  # type: ignore[method-assign]
-        rules.check_recovery_completion()
-
-    balance, _, _rest_acc = store.get_accrued_playtime(CHILD_PHONE)
-    assert balance == 0
-
-    rules._get_local_now = lambda: start + timedelta(minutes=180)  # type: ignore[method-assign]
-    rules.check_recovery_completion()
-
-    balance, _, rest_acc = store.get_accrued_playtime(CHILD_PHONE)
-    assert balance == 180
-    assert rest_acc == 0.0
-
-    rules._get_local_now = lambda: start + timedelta(minutes=212)  # type: ignore[method-assign]
-    assert rules.check_recovery_completion() is None
-    balance, _, rest_acc = store.get_accrued_playtime(CHILD_PHONE)
-    assert balance == 180
-    assert int(rest_acc) == 32
-
-    rules._get_local_now = lambda: start + timedelta(minutes=240)  # type: ignore[method-assign]
-    assert rules.check_recovery_completion() is not None
-    balance, _, rest_acc = store.get_accrued_playtime(CHILD_PHONE)
-    assert balance == 0
-    assert rest_acc == 0.0
+    balance, recovery_started = store.get_bank_state(CHILD_PHONE, "recovery")
+    assert balance == 88
+    assert recovery_started == stop_at
 
 
 def test_playtime_rules_active_session_request_uses_surplus_only(tmp_path: Path) -> None:
@@ -409,38 +311,11 @@ def test_playtime_rules_active_session_smaller_request_no_refund(tmp_path: Path)
     assert active[2] == 60  # unchanged
 
 
-def test_playtime_rules_status_active_recovery_calculates_without_persisting(tmp_path: Path) -> None:
-    store = build_store(tmp_path)
-    settings = build_settings(tmp_path, break_recovery_rate=3.0)
-    i18n = RecordingI18n()
-    rules = PlaytimeRules(
-        CHILD_PHONE,
-        settings,
-        store,
-        profile_provider=lambda: settings.default_rule_profile,
-        i18n=i18n,  # type: ignore[arg-type]
-    )
-
-    start = datetime(2025, 1, 6, 10, 0, tzinfo=timezone.utc)
-    now = start + timedelta(minutes=30)
-    rules._get_local_now = lambda: now  # type: ignore[method-assign]
-
-    store.add_session(CHILD_PHONE, start, 60)
-    store.set_accrued_playtime(CHILD_PHONE, 0, start)
-
-    rules.get_status()
-    balance, _, _rest = store.get_accrued_playtime(CHILD_PHONE)
-    status_call = next(kwargs for key, kwargs in i18n.calls if key == "rules.status_accrued_playtime")
-    assert status_call == {"balance": "30m", "max_balance": "3h"}
-    assert balance == 0
-
-
 def test_playtime_rules_status_reports_each_bank_against_its_maximum(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(
         tmp_path,
         banks={"default": BankProfile("default", 60, 100)},
-        accrued_playtime_max_minutes=300,
     )
     i18n = RecordingI18n()
     rules = PlaytimeRules(
@@ -515,8 +390,6 @@ def test_bank_balance_persists_on_profile_switch_until_rollover(tmp_path: Path) 
     low_profile = RuleProfile(
         name="low",
         banks={"default": BankProfile("default", 30, 90)},
-        accrued_playtime_max_minutes=180,
-        break_recovery_rate=3.0,
         blackout_periods=[],
     )
     active_profile = [high_profile]
@@ -540,10 +413,12 @@ def test_playtime_rules_rollover_week(tmp_path: Path) -> None:
     rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
 
     store.set_bank_balance(CHILD_PHONE, 500)
+    store.set_bank_balance(CHILD_PHONE, 60, "recovery")
 
     _result = rules.rollover_week()
 
     assert store.get_bank_balance(CHILD_PHONE) == 1340
+    assert store.get_bank_balance(CHILD_PHONE, "recovery") == 60
 
 
 def test_playtime_rules_set_bank(tmp_path: Path) -> None:

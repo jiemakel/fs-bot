@@ -33,14 +33,6 @@ def _set_minimal_env(monkeypatch) -> None:
     monkeypatch.setenv("CHILD_1_NAME", "Child1")
 
 
-def test_settings_does_not_bootstrap_rule_profile_from_environment(monkeypatch) -> None:
-    _set_minimal_env(monkeypatch)
-
-    settings = Settings.from_env()
-
-    assert settings.default_rule_profile is None
-
-
 def test_parse_profile_definition_preserves_bank_order_and_shared_blackout_days() -> None:
     profile = parse_rule_profile_definition(
         "normal",
@@ -48,16 +40,16 @@ def test_parse_profile_definition_preserves_bank_order_and_shared_blackout_days(
             "banks": {
                 "earned": {"weekly_addition": "1h30m", "max_balance": "42h"},
                 "weekly": {"weekly_addition": "30h", "max_balance": "30h"},
+                "recovery": {"recovery_rate": 3.0, "max_balance": "3h"},
             },
-            "accrued_playtime_max": "3h",
-            "break_recovery_rate": 3.0,
             "blackouts": [{"days": ["mon", "wed"], "start": "21:30", "end": "24:00"}],
         },
     )
 
-    assert list(profile.banks) == ["earned", "weekly"]
+    assert list(profile.banks) == ["earned", "weekly", "recovery"]
     assert profile.default_bank.name == "earned"
     assert profile.banks["earned"].weekly_addition_minutes == 90
+    assert profile.banks["recovery"].recovery_rate == 3.0
     assert profile.blackout_periods == [(0, "21:30", "24:00"), (2, "21:30", "24:00")]
 
 
@@ -67,8 +59,6 @@ def test_parse_profile_definition_rejects_unknown_fields() -> None:
             "invalid",
             {
                 "banks": {"earned": {"weekly_addition": "14h", "max_balance": "42h"}},
-                "accrued_playtime_max": "3h",
-                "break_recovery_rate": 3.0,
                 "blackouts": [],
                 "typo": True,
             },
@@ -83,13 +73,28 @@ def test_parse_profile_definition_uses_first_bank_as_default() -> None:
                 "earned": {"weekly_addition": "14h", "max_balance": "42h"},
                 "weekly": {"weekly_addition": "30h", "max_balance": "30h"},
             },
-            "accrued_playtime_max": "3h",
-            "break_recovery_rate": 3,
             "blackouts": [],
         },
     )
 
     assert profile.default_bank.name == "earned"
+
+
+def test_parse_profile_definition_requires_one_replenishment_policy_per_bank() -> None:
+    with pytest.raises(ValueError, match="exactly one"):
+        parse_rule_profile_definition(
+            "invalid",
+            {
+                "banks": {
+                    "mixed": {
+                        "weekly_addition": "1h",
+                        "recovery_rate": 3.0,
+                        "max_balance": "3h",
+                    }
+                },
+                "blackouts": [],
+            },
+        )
 
 
 def test_settings_parses_bot_language(monkeypatch) -> None:

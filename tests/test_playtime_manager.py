@@ -9,7 +9,7 @@ import sqlite3
 import pytest
 from signalbot import Context, SignalBot
 
-from family_safety_bot.config import BankProfile
+from family_safety_bot.config import BankProfile, Child
 from family_safety_bot.storage import PlaytimeStore
 from family_safety_bot.watcher import PlaytimeManager
 from tests.helpers import ADMIN_PHONE, CHILD_PHONE, build_settings, build_store
@@ -53,7 +53,12 @@ class FakeBot:
 
 def _build_manager(tmp_path: Path, **settings_overrides: Any) -> tuple[PlaytimeManager, PlaytimeStore]:
     store = build_store(tmp_path)
-    manager = PlaytimeManager(build_settings(tmp_path, **settings_overrides), store)
+    settings = build_settings(tmp_path, **settings_overrides)
+    if settings.default_rule_profile is not None:
+        store.upsert_rule_profile(settings.default_rule_profile)
+        for child_phone in settings.children:
+            store.set_active_rule_profile_name_for_child(child_phone, settings.default_rule_profile.name)
+    manager = PlaytimeManager(settings, store)
     manager.bot = cast(SignalBot, FakeBot(sent=[]))
     return manager, store
 
@@ -66,9 +71,10 @@ def _profile_json(banks: dict[str, dict[str, str]] | None = None) -> str:
     return json.dumps(
         {
             "banks": banks
-            or {"default": {"weekly_addition": "14h", "max_balance": "1h"}},
-            "accrued_playtime_max": "3h",
-            "break_recovery_rate": 3.0,
+            or {
+                "default": {"weekly_addition": "14h", "max_balance": "1h"},
+                "recovery": {"recovery_rate": 3.0, "max_balance": "3h"},
+            },
             "blackouts": [],
         }
     )
@@ -84,6 +90,20 @@ def test_playtime_manager_status_command(tmp_path: Path) -> None:
     assert len(ctx.sent_messages) == 1
     assert store.get_bank_balance(CHILD_PHONE) == 120
     assert store.get_active_session(CHILD_PHONE) is None
+
+
+def test_playtime_manager_status_sends_one_message_per_child(tmp_path: Path) -> None:
+    second_phone = "+1234567892"
+    children = {
+        CHILD_PHONE: Child(CHILD_PHONE, "child123", "TestChild"),
+        second_phone: Child(second_phone, "child456", "SecondChild"),
+    }
+    manager, _store = _build_manager(tmp_path, children=children)
+
+    ctx = FakeContext(message_text="status", sender=ADMIN_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert len(ctx.sent_messages) == len(children)
 
 
 def test_playtime_manager_status_includes_pending_activity_claims(tmp_path: Path) -> None:
@@ -193,14 +213,13 @@ def test_playtime_manager_natural_session_completion_notifies_group(tmp_path: Pa
     base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
     rules._get_local_now = lambda: base  # type: ignore[method-assign]
     
-    store.set_accrued_playtime(CHILD_PHONE, 0, base)
     store.add_session(CHILD_PHONE, base, 30)
     
     # Fast-forward 40 minutes (past session end)
     rules._get_local_now = lambda: base + timedelta(minutes=40)  # type: ignore[method-assign]
     
     # Run status check scheduler task
-    asyncio.run(manager._check_recovery_completion())
+    asyncio.run(manager._check_automatic_updates())
     
     # We should have sent a notification to the group
     bot = cast(FakeBot, manager.bot)
@@ -308,14 +327,12 @@ def test_playtime_manager_child_request_accepts_compound_duration(tmp_path: Path
 def test_playtime_manager_partial_grant_applies_multiple_caps(tmp_path: Path) -> None:
     manager, store = _build_manager(
         tmp_path,
-        accrued_playtime_max_minutes=40,
         blackout_periods=[(0, "21:00", "24:00")],
     )
     rules = manager._rules_by_child[CHILD_PHONE]
     fixed_now = rules._get_local_now().replace(year=2025, month=1, day=6, hour=20, minute=30, second=0, microsecond=0)
     rules._get_local_now = lambda: fixed_now  # type: ignore[method-assign]
     store.set_bank_balance(CHILD_PHONE, 20)
-    store.set_accrued_playtime(CHILD_PHONE, 10, fixed_now)
 
     async def fake_grant(child_id: str, minutes: int) -> bool:
         return child_id == "child123" and minutes == 20
@@ -367,55 +384,23 @@ def test_playtime_manager_child_end_does_not_complete_when_block_fails(tmp_path:
     assert active[0] == session_id
 
 
-def test_playtime_manager_recovery_completion_sends_group_notification(tmp_path: Path) -> None:
+def test_playtime_manager_recovery_bank_completion_sends_one_notification(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
     rules = manager._rules_by_child[CHILD_PHONE]
     base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
-    store.set_accrued_playtime(CHILD_PHONE, 90, base)
+    store.set_bank_balance(CHILD_PHONE, 90, "recovery", base)
     rules._get_local_now = lambda: base + timedelta(minutes=30)  # type: ignore[method-assign]
 
-    asyncio.run(manager._check_recovery_completion())
+    asyncio.run(manager._check_automatic_updates())
 
     bot = cast(FakeBot, manager.bot)
     assert len(bot.sent) == 1
     receiver, _message = bot.sent[0]
     assert receiver == manager._settings.signal_group_id
-    assert store.get_accrued_playtime(CHILD_PHONE)[0] == 0
+    assert store.get_bank_balance(CHILD_PHONE, "recovery") == 180
 
-    asyncio.run(manager._check_recovery_completion())
+    asyncio.run(manager._check_automatic_updates())
     assert len(bot.sent) == 1
-
-
-def test_playtime_manager_scheduler_ticks_do_not_shrink_session_recovery_debt(tmp_path: Path) -> None:
-    manager, store = _build_manager(tmp_path)
-    rules = manager._rules_by_child[CHILD_PHONE]
-    start = datetime(2025, 1, 6, 10, 0, tzinfo=timezone.utc)
-    store.add_session(CHILD_PHONE, start, 180)
-    store.set_accrued_playtime(CHILD_PHONE, 0, start)
-
-    for tick in range(1, 184):
-        rules._get_local_now = lambda tick=tick: start + timedelta(seconds=59 * tick)  # type: ignore[method-assign]
-        asyncio.run(manager._check_recovery_completion())
-
-    bot = cast(FakeBot, manager.bot)
-    assert bot.sent == []
-    assert store.get_accrued_playtime(CHILD_PHONE)[0] == 0
-
-    rules._get_local_now = lambda: start + timedelta(minutes=180)  # type: ignore[method-assign]
-    asyncio.run(manager._check_recovery_completion())
-
-    assert len(bot.sent) == 1
-    assert store.get_accrued_playtime(CHILD_PHONE)[0] == 180
-
-    rules._get_local_now = lambda: start + timedelta(minutes=212)  # type: ignore[method-assign]
-    asyncio.run(manager._check_recovery_completion())
-    assert len(bot.sent) == 1
-
-    rules._get_local_now = lambda: start + timedelta(minutes=240)  # type: ignore[method-assign]
-    asyncio.run(manager._check_recovery_completion())
-
-    assert len(bot.sent) == 2
-    assert store.get_accrued_playtime(CHILD_PHONE)[0] == 0
 
 
 def test_playtime_manager_child_profile_switch_affects_limits(tmp_path: Path) -> None:
@@ -426,6 +411,8 @@ def test_playtime_manager_child_profile_switch_affects_limits(tmp_path: Path) ->
         manager,
         FakeContext(message_text=f"profile define strict {profile_json}", sender=ADMIN_PHONE, sent_messages=[]),
     )
+    persisted = next(profile for profile in store.list_rule_profiles() if profile.name == "strict")
+    assert persisted.banks["recovery"].recovery_rate == 3.0
     _run_handle(manager, FakeContext(message_text="profile use strict TestChild", sender=ADMIN_PHONE, sent_messages=[]))
 
     ctx = FakeContext(message_text="TestChild 2h", sender=ADMIN_PHONE, sent_messages=[])

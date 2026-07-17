@@ -22,11 +22,16 @@ class Child:
 
 @dataclass(frozen=True)
 class BankProfile:
-    """Rollover and balance limits for one named playtime bank."""
+    """Balance limits and replenishment policy for one playtime bank."""
 
     name: str
-    weekly_addition_minutes: int
+    weekly_addition_minutes: int | None
     max_balance_minutes: int
+    recovery_rate: float | None = None
+
+    @property
+    def is_recovery(self) -> bool:
+        return self.recovery_rate is not None
 
 
 @dataclass(frozen=True)
@@ -35,8 +40,6 @@ class RuleProfile:
 
     name: str
     banks: dict[str, BankProfile]
-    accrued_playtime_max_minutes: int
-    break_recovery_rate: float
     blackout_periods: list[tuple[int, str, str]]
 
     @property
@@ -92,7 +95,7 @@ def parse_rule_profile_definition(name: str, definition: Any) -> RuleProfile:
     """Parse a strict JSON-compatible profile definition."""
     if not isinstance(definition, dict):
         raise ValueError("Profile definition must be a JSON object.")
-    required_fields = {"banks", "accrued_playtime_max", "break_recovery_rate", "blackouts"}
+    required_fields = {"banks", "blackouts"}
     if set(definition) != required_fields:
         raise ValueError(f"Profile fields must be exactly: {sorted(required_fields)}")
 
@@ -100,28 +103,33 @@ def parse_rule_profile_definition(name: str, definition: Any) -> RuleProfile:
     if not isinstance(raw_banks, dict) or not raw_banks:
         raise ValueError("Profile must define at least one bank.")
     banks: dict[str, BankProfile] = {}
-    bank_fields = {"weekly_addition", "max_balance"}
     for raw_name, raw_bank in raw_banks.items():
-        if not isinstance(raw_bank, dict) or set(raw_bank) != bank_fields:
-            raise ValueError(f"Bank fields must be exactly: {sorted(bank_fields)}")
+        if not isinstance(raw_bank, dict):
+            raise ValueError("Each bank must be a JSON object.")
+        fields = set(raw_bank)
+        weekly_fields = {"weekly_addition", "max_balance"}
+        recovery_fields = {"recovery_rate", "max_balance"}
+        if fields not in (weekly_fields, recovery_fields):
+            raise ValueError("Each bank must define max_balance and exactly one replenishment policy.")
         bank_name = normalize_profile_name(str(raw_name))
-        weekly_minutes = parse_duration_minutes(str(raw_bank["weekly_addition"]))
         max_minutes = parse_duration_minutes(str(raw_bank["max_balance"]))
-        if weekly_minutes is None or weekly_minutes <= 0:
-            raise ValueError(f"Invalid weekly addition for bank {bank_name!r}.")
         if max_minutes is None or max_minutes <= 0:
             raise ValueError(f"Invalid maximum balance for bank {bank_name!r}.")
+        weekly_minutes: int | None = None
+        recovery_rate: float | None = None
+        if fields == weekly_fields:
+            weekly_minutes = parse_duration_minutes(str(raw_bank["weekly_addition"]))
+            if weekly_minutes is None or weekly_minutes <= 0:
+                raise ValueError(f"Invalid weekly addition for bank {bank_name!r}.")
+        else:
+            raw_rate = raw_bank["recovery_rate"]
+            if isinstance(raw_rate, bool) or not isinstance(raw_rate, (int, float)) or raw_rate <= 0:
+                raise ValueError(f"Invalid recovery rate for bank {bank_name!r}.")
+            recovery_rate = float(raw_rate)
         key = bank_name.lower()
         if key in banks:
             raise ValueError(f"Duplicate bank name: {bank_name!r}.")
-        banks[key] = BankProfile(bank_name, weekly_minutes, max_minutes)
-
-    accrued_max = parse_duration_minutes(str(definition["accrued_playtime_max"]))
-    if accrued_max is None or accrued_max <= 0:
-        raise ValueError("Invalid accrued_playtime_max.")
-    recovery_rate = definition["break_recovery_rate"]
-    if isinstance(recovery_rate, bool) or not isinstance(recovery_rate, (int, float)) or recovery_rate <= 0:
-        raise ValueError("break_recovery_rate must be a positive number.")
+        banks[key] = BankProfile(bank_name, weekly_minutes, max_minutes, recovery_rate)
 
     raw_blackouts = definition["blackouts"]
     if not isinstance(raw_blackouts, list):
@@ -151,8 +159,6 @@ def parse_rule_profile_definition(name: str, definition: Any) -> RuleProfile:
     return RuleProfile(
         name=normalize_profile_name(name),
         banks=banks,
-        accrued_playtime_max_minutes=accrued_max,
-        break_recovery_rate=float(recovery_rate),
         blackout_periods=blackout_periods,
     )
 
@@ -168,9 +174,6 @@ class Settings:
     signal_admins: list[str]  # List of admin phone numbers
     signal_group_id: str  # Signal group ID where all communication happens
 
-    # Optional programmatic bootstrap profile. Environment configuration leaves this unset.
-    default_rule_profile: RuleProfile | None
-    
     # General settings
     timezone: str
     data_dir: str
@@ -221,7 +224,6 @@ class Settings:
             children=children,
             signal_admins=signal_admins,
             signal_group_id=signal_group_id,
-            default_rule_profile=None,
             timezone=env.get("TZ", "Europe/Helsinki"),
             data_dir=env.get("DATA_DIR", "./data"),
             bot_language=env.get("BOT_LANGUAGE", "en"),
