@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
-import shlex
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from typing import Awaitable, Callable
@@ -15,10 +15,9 @@ from family_safety_bot.config import (
     Child,
     RuleProfile,
     Settings,
-    WEEKDAY_NAME_TO_INDEX,
     WEEKDAY_SUFFIXES,
     normalize_profile_name,
-    parse_day_blackout_periods,
+    parse_rule_profile_definition,
 )
 from family_safety_bot.durations import parse_activity_claim, parse_duration_minutes, parse_signed_duration_minutes
 from family_safety_bot.formatting import format_duration
@@ -49,21 +48,6 @@ _COMMAND_KEYS = (
     "admin_profile_define",
     "admin_profile_use",
 )
-_PROFILE_REQUIRED_ENV_KEYS = (
-    "WEEKLY_ADDITION_TIME",
-    "MAX_BANK_TIME",
-    "ACCRUED_PLAYTIME_MAX_TIME",
-    "BREAK_RECOVERY_RATE",
-    "BLACKOUT_PERIOD_MON",
-    "BLACKOUT_PERIOD_TUE",
-    "BLACKOUT_PERIOD_WED",
-    "BLACKOUT_PERIOD_THU",
-    "BLACKOUT_PERIOD_FRI",
-    "BLACKOUT_PERIOD_SAT",
-    "BLACKOUT_PERIOD_SUN",
-)
-
-
 class PlaytimeManager(Command):
     """Handle playtime requests via Signal commands."""
     
@@ -122,10 +106,11 @@ class PlaytimeManager(Command):
     def _initialize_profiles(self) -> None:
         existing = self._store.list_rule_profiles()
         self._profiles_by_name = {profile.name.lower(): profile for profile in existing}
-        default_key = self._default_profile.name.lower()
-        if default_key not in self._profiles_by_name:
-            self._profiles_by_name[default_key] = self._default_profile
-            self._store.upsert_rule_profile(self._default_profile)
+        if self._default_profile is not None:
+            default_key = self._default_profile.name.lower()
+            if default_key not in self._profiles_by_name:
+                self._profiles_by_name[default_key] = self._default_profile
+                self._store.upsert_rule_profile(self._default_profile)
 
         self._active_profile_name_by_child = {}
         for child_id in self._settings.children:
@@ -134,8 +119,15 @@ class PlaytimeManager(Command):
                 self._active_profile_name_by_child[child_id] = self._profiles_by_name[child_active_name.lower()].name
 
     def _profile_for_child(self, phone_number: str) -> RuleProfile:
-        active_name = self._active_profile_name_by_child.get(phone_number, self._default_profile.name)
+        active_name = self._active_profile_name_by_child.get(phone_number)
+        if active_name is None and self._default_profile is not None:
+            active_name = self._default_profile.name
+        if active_name is None:
+            raise RuntimeError(f"No rule profile assigned to {phone_number}")
         return self._profiles_by_name[active_name.lower()]
+
+    def _has_profile(self, phone_number: str) -> bool:
+        return phone_number in self._active_profile_name_by_child or self._default_profile is not None
     
     async def _resolve_child(
         self,
@@ -208,80 +200,22 @@ class PlaytimeManager(Command):
             )
             for idx, suffix in enumerate(WEEKDAY_SUFFIXES)
         )
+        bank_lines = "\n".join(
+            self._i18n.msg(
+                "watcher.profile_summary_bank",
+                bank_name=bank.name,
+                weekly_addition=format_duration(bank.weekly_addition_minutes),
+                max_balance=format_duration(bank.max_balance_minutes),
+            )
+            for bank in profile.banks.values()
+        )
         return self._i18n.msg(
             "watcher.profile_summary",
             name=profile.name,
-            weekly_addition=format_duration(profile.weekly_addition_minutes),
-            weekly_max=format_duration(profile.weekly_max_minutes),
-            max_bank=format_duration(profile.max_bank_minutes),
+            banks=bank_lines,
             accrued_max=format_duration(profile.accrued_playtime_max_minutes),
             break_recovery_rate=f"{profile.break_recovery_rate:.2f}",
             blackouts=blackout_lines,
-        )
-
-    @staticmethod
-    def _parse_env_assignments(payload: str) -> dict[str, str] | None:
-        try:
-            tokens = shlex.split(payload)
-        except ValueError:
-            return None
-        assignments = {}
-        for token in tokens:
-            if "=" not in token:
-                return None
-            key, value = token.split("=", 1)
-            if not (key := key.strip()):
-                return None
-            assignments[key] = value.strip()
-        return assignments
-
-    @staticmethod
-    def _positive_duration_assignment(assignments: dict[str, str], key: str) -> int:
-        if minutes := parse_duration_minutes(assignments[key]):
-            if minutes > 0:
-                return minutes
-        raise ValueError
-
-    def _build_profile_from_env_assignments(self, profile_name: str, assignments: dict[str, str]) -> RuleProfile:
-        if missing := set(_PROFILE_REQUIRED_ENV_KEYS) - set(assignments):
-            raise ValueError(f"Missing required keys: {missing}")
-
-        def get_duration(key: str) -> int:
-            if (minutes := parse_duration_minutes(assignments[key])) and minutes > 0:
-                return minutes
-            raise ValueError
-
-        def get_optional_duration(key: str, default: str) -> int:
-            if (minutes := parse_duration_minutes(assignments.get(key, default))) and minutes > 0:
-                return minutes
-            raise ValueError
-
-        blackout_periods = [
-            period
-            for suffix in WEEKDAY_SUFFIXES
-            if (day_value := assignments.get(f"BLACKOUT_PERIOD_{suffix}", ""))
-            for period in parse_day_blackout_periods(
-                day_value,
-                WEEKDAY_NAME_TO_INDEX[suffix.lower()],
-                f"profile env BLACKOUT_PERIOD_{suffix}",
-            )
-        ]
-
-        try:
-            break_recovery_rate = float(assignments["BREAK_RECOVERY_RATE"])
-            if break_recovery_rate <= 0:
-                raise ValueError
-        except ValueError:
-            raise ValueError("Invalid BREAK_RECOVERY_RATE")
-
-        return RuleProfile(
-            name=profile_name,
-            weekly_addition_minutes=get_duration("WEEKLY_ADDITION_TIME"),
-            weekly_max_minutes=get_optional_duration("WEEKLY_MAX_TIME", "30h"),
-            max_bank_minutes=get_duration("MAX_BANK_TIME"),
-            accrued_playtime_max_minutes=get_duration("ACCRUED_PLAYTIME_MAX_TIME"),
-            break_recovery_rate=break_recovery_rate,
-            blackout_periods=blackout_periods,
         )
 
     async def _handle_profile_command(self, ctx: Context, payload: str) -> None:
@@ -314,7 +248,6 @@ class PlaytimeManager(Command):
         ordered = sorted(self._profiles_by_name.values(), key=lambda p: p.name.lower())
         lines = [
             f"* {profile.name}"
-            + (self._i18n.msg("watcher.profile_default_marker") if profile.name.lower() == self._default_profile.name.lower() else "")
             for profile in ordered
         ]
         await ctx.send(self._i18n.msg("watcher.profile_list_header") + "\n" + "\n".join(lines))
@@ -355,13 +288,10 @@ class PlaytimeManager(Command):
         except ValueError:
             await ctx.send(self._i18n.msg("watcher.profile_invalid"))
             return
-        assignments = self._parse_env_assignments(parts[2])
-        if assignments is None:
-            await ctx.send(self._i18n.msg("watcher.profile_invalid"))
-            return
         try:
-            created = self._build_profile_from_env_assignments(name, assignments)
-        except ValueError:
+            definition = json.loads(parts[2])
+            created = parse_rule_profile_definition(name, definition)
+        except (json.JSONDecodeError, ValueError):
             await ctx.send(self._i18n.msg("watcher.profile_invalid"))
             return
         try:
@@ -425,7 +355,10 @@ class PlaytimeManager(Command):
         lines = [f"[{child.name}]"]
         if self._store.is_child_block_mode_enabled(child_id):
             lines.append(self._i18n.msg("watcher.status_child_block_mode_enabled"))
-        lines.append(self._rules_by_child[child_id].get_status())
+        if self._has_profile(child_id):
+            lines.append(self._rules_by_child[child_id].get_status())
+        else:
+            lines.append(self._i18n.msg("watcher.profile_not_assigned"))
         if claims := self._store.get_pending_claims(child_id):
             lines.append(self._format_claims_response(child, claims))
         return "\n".join(lines)
@@ -466,6 +399,9 @@ class PlaytimeManager(Command):
 
     async def _handle_admin_rollover_command(self, ctx: Context, payload: str) -> bool:
         async def action(child: Child, rules: PlaytimeRules) -> None:
+            if not self._has_profile(child.phone_number):
+                await self._send_admin_result(ctx, child, self._i18n.msg("watcher.profile_not_assigned"))
+                return
             await self._send_admin_result(ctx, child, rules.rollover_week())
         return await self._run_for_resolved_children(ctx, payload, action)
 
@@ -484,6 +420,9 @@ class PlaytimeManager(Command):
 
     async def _handle_admin_ack_command(self, ctx: Context, payload: str) -> bool:
         async def action(child: Child, rules: PlaytimeRules) -> None:
+            if not self._has_profile(child.phone_number):
+                await self._send_admin_result(ctx, child, self._i18n.msg("watcher.profile_not_assigned"))
+                return
             claims = self._store.get_pending_claims(child.phone_number)
             if not claims:
                 await ctx.send(self._i18n.msg("watcher.no_pending_claims", child_name=child.name))
@@ -500,15 +439,48 @@ class PlaytimeManager(Command):
         return await self._run_for_resolved_children(ctx, payload, action)
 
     async def _handle_admin_bank_command(self, ctx: Context, message_text: str) -> bool:
-        resolved = await self._parse_children_and_minutes(ctx, message_text, parse_signed_duration_minutes)
-        if not resolved:
+        parsed = self._parse_admin_bank_payload(message_text)
+        if parsed is None:
             return False
-        children, minutes, is_relative = resolved
+        children, bank_name, minutes, is_relative = parsed
         for child, rules in children:
-            pending_note = self._auto_handle_pending_claims(child)
-            result = rules.modify_bank(minutes) if is_relative else rules.set_bank(minutes)
+            if not self._has_profile(child.phone_number):
+                await self._send_admin_result(ctx, child, self._i18n.msg("watcher.profile_not_assigned"))
+                continue
+            pending_note = self._auto_handle_pending_claims(child) if bank_name is None else ""
+            result = (
+                rules.modify_bank(minutes, bank_name)
+                if is_relative
+                else rules.set_bank(minutes, bank_name)
+            )
             await self._send_admin_result(ctx, child, result + pending_note)
         return True
+
+    def _parse_admin_bank_payload(
+        self,
+        payload: str,
+    ) -> tuple[list[tuple[Child, PlaytimeRules]], str | None, int, bool] | None:
+        parts = payload.strip().split()
+        if not parts:
+            return None
+
+        def parsed_duration(text: str) -> tuple[int, bool] | None:
+            minutes = parse_signed_duration_minutes(text)
+            return None if minutes is None else (minutes, not text.lstrip().startswith("="))
+
+        if len(parts) >= 3 and (child_rules := self._children_by_name.get(parts[0].lower())):
+            if parsed := parsed_duration(" ".join(parts[2:])):
+                child, rules = child_rules
+                return ([(child, rules)], parts[1], parsed[0], parsed[1])
+        if len(parts) >= 2 and (child_rules := self._children_by_name.get(parts[0].lower())):
+            if parsed := parsed_duration(" ".join(parts[1:])):
+                child, rules = child_rules
+                return ([(child, rules)], None, parsed[0], parsed[1])
+        if len(parts) >= 2 and (parsed := parsed_duration(" ".join(parts[1:]))):
+            return (self._all_children(), parts[0], parsed[0], parsed[1])
+        if parsed := parsed_duration(payload):
+            return (self._all_children(), None, parsed[0], parsed[1])
+        return None
 
     def setup(self) -> None:
         """Set up scheduled tasks."""
@@ -669,6 +641,16 @@ class PlaytimeManager(Command):
             await ctx.send(self._i18n.msg("watcher.positive_duration_required", sender_name=sender_name))
             return
 
+        if not self._has_profile(child.phone_number):
+            await ctx.send(
+                self._i18n.msg(
+                    "watcher.request_denied",
+                    sender_name=sender_name,
+                    reason=self._i18n.msg("watcher.profile_not_assigned"),
+                )
+            )
+            return
+
         if self._store.is_child_block_mode_enabled(child.phone_number):
             await ctx.send(
                 self._i18n.msg(
@@ -705,6 +687,9 @@ class PlaytimeManager(Command):
         """Enable grant block mode for a child and end any active session."""
         self._store.set_child_block_mode(child.phone_number, True)
         block_msg = self._i18n.msg("watcher.admin_child_blocked", child_name=child.name)
+        if not self._has_profile(child.phone_number):
+            await ctx.send(block_msg)
+            return
         result = await self._complete_session_after_block(
             ctx,
             child,
@@ -726,6 +711,9 @@ class PlaytimeManager(Command):
 
     async def admin_end_session_command(self, ctx: Context, child: Child, rules: PlaytimeRules) -> None:
         """Admin end active session."""
+        if not self._has_profile(child.phone_number):
+            await self._send_admin_result(ctx, child, self._i18n.msg("watcher.profile_not_assigned"))
+            return
         result = await self._complete_session_after_block(
             ctx,
             child,
@@ -744,6 +732,9 @@ class PlaytimeManager(Command):
         rules: PlaytimeRules,
         sender_name: str,
     ) -> None:
+        if not self._has_profile(child.phone_number):
+            await ctx.send(f"[{sender_name}]\n" + self._i18n.msg("watcher.profile_not_assigned"))
+            return
         result = await self._complete_session_after_block(
             ctx,
             child,
@@ -760,6 +751,7 @@ class PlaytimeManager(Command):
         results = [
             f"{child.name}: {self._rules_by_child[phone].rollover_week()}"
             for phone, child in self._settings.children.items()
+            if self._has_profile(phone)
         ]
         for result in results:
             logger.info("Weekly rollover for %s", result)
@@ -776,6 +768,8 @@ class PlaytimeManager(Command):
         results = []
         for phone, child in self._settings.children.items():
             rules = self._rules_by_child[phone]
+            if not self._has_profile(phone):
+                continue
             local_now = rules._get_local_now()
             
             # Check if active session has expired naturally

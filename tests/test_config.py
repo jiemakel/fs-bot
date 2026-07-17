@@ -2,19 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from family_safety_bot.config import Settings, WEEKDAY_SUFFIXES
+from family_safety_bot.config import Settings, parse_rule_profile_definition
 
 _OPTIONAL_SETTINGS_ENV_KEYS = (
     "BOT_LANGUAGE",
-    "WEEKLY_ADDITION_TIME",
-    "WEEKLY_MAX_TIME",
-    "MAX_BANK_TIME",
-    "ACCRUED_PLAYTIME_MAX_TIME",
-    "BREAK_RECOVERY_RATE",
-    "RULE_PROFILE_DEFAULT_NAME",
     "TZ",
     "DATA_DIR",
-    *[f"BLACKOUT_PERIOD_{suffix}" for suffix in WEEKDAY_SUFFIXES],
     *[f"ADMIN_{index}_PHONE" for index in range(1, 12)],
     *[
         f"CHILD_{index}_{suffix}"
@@ -40,38 +33,63 @@ def _set_minimal_env(monkeypatch) -> None:
     monkeypatch.setenv("CHILD_1_NAME", "Child1")
 
 
-def test_settings_time_accepts_h_m_and_h_plus_m(monkeypatch) -> None:
-    monkeypatch.setenv("WEEKLY_ADDITION_TIME", "1h+30m")
-    monkeypatch.setenv("WEEKLY_MAX_TIME", "30h")
-    monkeypatch.setenv("MAX_BANK_TIME", "150m")
-    monkeypatch.setenv("ACCRUED_PLAYTIME_MAX_TIME", "2h")
+def test_settings_does_not_bootstrap_rule_profile_from_environment(monkeypatch) -> None:
     _set_minimal_env(monkeypatch)
 
     settings = Settings.from_env()
 
-    assert settings.default_rule_profile.weekly_addition_minutes == 90
-    assert settings.default_rule_profile.weekly_max_minutes == 1800
-    assert settings.default_rule_profile.max_bank_minutes == 150
-    assert settings.default_rule_profile.accrued_playtime_max_minutes == 120
+    assert settings.default_rule_profile is None
 
 
-def test_settings_time_accepts_compact_combined_notation(monkeypatch) -> None:
-    monkeypatch.setenv("WEEKLY_ADDITION_TIME", "1h30m")
-    monkeypatch.setenv("MAX_BANK_TIME", "42h")
-    monkeypatch.setenv("ACCRUED_PLAYTIME_MAX_TIME", "3h")
-    _set_minimal_env(monkeypatch)
+def test_parse_profile_definition_preserves_bank_order_and_shared_blackout_days() -> None:
+    profile = parse_rule_profile_definition(
+        "normal",
+        {
+            "banks": {
+                "earned": {"weekly_addition": "1h30m", "max_balance": "42h"},
+                "weekly": {"weekly_addition": "30h", "max_balance": "30h"},
+            },
+            "accrued_playtime_max": "3h",
+            "break_recovery_rate": 3.0,
+            "blackouts": [{"days": ["mon", "wed"], "start": "21:30", "end": "24:00"}],
+        },
+    )
 
-    settings = Settings.from_env()
+    assert list(profile.banks) == ["earned", "weekly"]
+    assert profile.default_bank.name == "earned"
+    assert profile.banks["earned"].weekly_addition_minutes == 90
+    assert profile.blackout_periods == [(0, "21:30", "24:00"), (2, "21:30", "24:00")]
 
-    assert settings.default_rule_profile.weekly_addition_minutes == 90
+
+def test_parse_profile_definition_rejects_unknown_fields() -> None:
+    with pytest.raises(ValueError, match="fields"):
+        parse_rule_profile_definition(
+            "invalid",
+            {
+                "banks": {"earned": {"weekly_addition": "14h", "max_balance": "42h"}},
+                "accrued_playtime_max": "3h",
+                "break_recovery_rate": 3.0,
+                "blackouts": [],
+                "typo": True,
+            },
+        )
 
 
-def test_settings_weekly_max_defaults_to_30_hours(monkeypatch) -> None:
-    _set_minimal_env(monkeypatch)
+def test_parse_profile_definition_uses_first_bank_as_default() -> None:
+    profile = parse_rule_profile_definition(
+        "normal",
+        {
+            "banks": {
+                "earned": {"weekly_addition": "14h", "max_balance": "42h"},
+                "weekly": {"weekly_addition": "30h", "max_balance": "30h"},
+            },
+            "accrued_playtime_max": "3h",
+            "break_recovery_rate": 3,
+            "blackouts": [],
+        },
+    )
 
-    settings = Settings.from_env()
-
-    assert settings.default_rule_profile.weekly_max_minutes == 1800
+    assert profile.default_bank.name == "earned"
 
 
 def test_settings_parses_bot_language(monkeypatch) -> None:
@@ -97,17 +115,3 @@ def test_settings_parses_more_than_nine_contiguous_admins_and_children(monkeypat
 
     assert settings.signal_admins[-1] == "+10000000010"
     assert settings.children["+20000000010"].name == "Child10"
-
-
-def test_settings_parses_day_specific_blackout_periods_including_24_00(monkeypatch) -> None:
-    _set_minimal_env(monkeypatch)
-    monkeypatch.setenv("BLACKOUT_PERIOD_MON", "08:00-09:00,20:30-24:00")
-    monkeypatch.setenv("BLACKOUT_PERIOD_WED", "14:15-15:45")
-
-    settings = Settings.from_env()
-
-    assert settings.default_rule_profile.blackout_periods == [
-        (0, "08:00", "09:00"),
-        (0, "20:30", "24:00"),
-        (2, "14:15", "15:45"),
-    ]

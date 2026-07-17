@@ -4,10 +4,10 @@ import json
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import TypeAlias
 
-from family_safety_bot.config import RuleProfile
+from family_safety_bot.config import BankProfile, RuleProfile
 
 ActiveSession: TypeAlias = tuple[int, datetime, int]
 
@@ -43,8 +43,10 @@ class PlaytimeStore:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS bank (
-                child_id TEXT PRIMARY KEY,
-                balance_minutes INTEGER NOT NULL DEFAULT 0
+                child_id TEXT NOT NULL,
+                bank_name TEXT NOT NULL,
+                balance_minutes INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (child_id, bank_name)
             );
             CREATE TABLE IF NOT EXISTS accrued_playtime (
                 child_id TEXT PRIMARY KEY,
@@ -60,11 +62,15 @@ class PlaytimeStore:
                 minutes_granted INTEGER NOT NULL,
                 completed INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS session_bank_debits (
+                session_id INTEGER NOT NULL,
+                bank_name TEXT NOT NULL,
+                minutes_debited INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (session_id, bank_name)
+            );
             CREATE TABLE IF NOT EXISTS rule_profiles (
                 profile_name TEXT PRIMARY KEY,
-                weekly_addition_minutes INTEGER NOT NULL,
-                weekly_max_minutes INTEGER NOT NULL DEFAULT 1800,
-                max_bank_minutes INTEGER NOT NULL,
+                banks_json TEXT NOT NULL,
                 accrued_playtime_max_minutes INTEGER NOT NULL,
                 break_recovery_rate REAL NOT NULL,
                 blackout_periods_json TEXT NOT NULL
@@ -118,16 +124,40 @@ class PlaytimeStore:
             if isinstance(item, (list, tuple)) and len(item) >= 3
         ]
 
+    @staticmethod
+    def _serialize_banks(banks: dict[str, BankProfile]) -> str:
+        return json.dumps(
+            [
+                {
+                    "name": bank.name,
+                    "weekly_addition_minutes": bank.weekly_addition_minutes,
+                    "max_balance_minutes": bank.max_balance_minutes,
+                }
+                for bank in banks.values()
+            ],
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _deserialize_banks(raw: str) -> dict[str, BankProfile]:
+        loaded = json.loads(raw)
+        return {
+            str(item["name"]).lower(): BankProfile(
+                name=str(item["name"]),
+                weekly_addition_minutes=int(item["weekly_addition_minutes"]),
+                max_balance_minutes=int(item["max_balance_minutes"]),
+            )
+            for item in loaded
+        }
+
     @classmethod
     def _rule_profile_from_row(cls, row: tuple) -> RuleProfile:
         return RuleProfile(
             name=row[0],
-            weekly_addition_minutes=row[1],
-            weekly_max_minutes=row[2],
-            max_bank_minutes=row[3],
-            accrued_playtime_max_minutes=row[4],
-            break_recovery_rate=row[5],
-            blackout_periods=cls._deserialize_blackout_periods(row[6]),
+            banks=cls._deserialize_banks(row[1]),
+            accrued_playtime_max_minutes=row[2],
+            break_recovery_rate=row[3],
+            blackout_periods=cls._deserialize_blackout_periods(row[4]),
         )
 
     def _set_app_state(self, key: str, value: str) -> None:
@@ -151,44 +181,47 @@ class PlaytimeStore:
     def _ensure_child_in_conn(self, conn: sqlite3.Connection, child_id: str) -> None:
         conn.execute(
             """
-            INSERT OR IGNORE INTO bank (child_id, balance_minutes)
-            VALUES (?, 0);
-            """,
-            (child_id,),
-        )
-        conn.execute(
-            """
             INSERT OR IGNORE INTO accrued_playtime (child_id, playtime_minutes, last_update_iso)
             VALUES (?, 0, datetime('now'));
             """,
             (child_id,),
         )
 
-    def get_bank_balance(self, child_id: str) -> int:
-        """Get current bank balance in minutes for a child."""
+    def get_bank_balance(self, child_id: str, bank_name: str = "default") -> int:
+        """Get one named bank balance for a child, creating it at zero if needed."""
+        self._execute(
+            "INSERT OR IGNORE INTO bank (child_id, bank_name, balance_minutes) VALUES (?, ?, 0);",
+            (child_id, bank_name.lower()),
+            commit=True,
+            child_id=child_id,
+        )
         row = self._execute(
-            "SELECT balance_minutes FROM bank WHERE child_id = ?;",
-            (child_id,),
+            "SELECT balance_minutes FROM bank WHERE child_id = ? AND bank_name = ?;",
+            (child_id, bank_name.lower()),
             child_id=child_id,
         ).fetchone()
         assert row is not None
         return row[0]
 
-    def set_bank_balance(self, child_id: str, balance_minutes: int) -> None:
-        """Set bank balance for a child."""
+    def get_bank_balances(self, child_id: str, bank_names: list[str]) -> dict[str, int]:
+        return {name.lower(): self.get_bank_balance(child_id, name) for name in bank_names}
+
+    def set_bank_balance(self, child_id: str, balance_minutes: int, bank_name: str = "default") -> None:
+        """Set one named bank balance for a child."""
+        self.get_bank_balance(child_id, bank_name)
         self._execute(
-            "UPDATE bank SET balance_minutes = ? WHERE child_id = ?;",
-            (balance_minutes, child_id),
+            "UPDATE bank SET balance_minutes = ? WHERE child_id = ? AND bank_name = ?;",
+            (balance_minutes, child_id, bank_name.lower()),
             commit=True,
             child_id=child_id,
         )
 
-    def add_to_bank(self, child_id: str, minutes: int, max_balance: int) -> int:
+    def add_to_bank(self, child_id: str, minutes: int, max_balance: int, bank_name: str = "default") -> int:
         """Add minutes to bank, capping at max_balance. Returns actual amount added."""
-        current = self.get_bank_balance(child_id)
+        current = self.get_bank_balance(child_id, bank_name)
         new_balance = min(current + minutes, max_balance)
         actual_added = new_balance - current
-        self.set_bank_balance(child_id, new_balance)
+        self.set_bank_balance(child_id, new_balance, bank_name)
         return actual_added
 
     def get_accrued_playtime(self, child_id: str) -> tuple[int, datetime, float]:
@@ -251,6 +284,25 @@ class PlaytimeStore:
             commit=True,
         )
 
+    def add_session_bank_debit(self, session_id: int, bank_name: str, minutes: int) -> None:
+        self._execute(
+            """
+            INSERT INTO session_bank_debits (session_id, bank_name, minutes_debited)
+            VALUES (?, ?, ?)
+            ON CONFLICT(session_id, bank_name) DO UPDATE SET
+                minutes_debited = minutes_debited + excluded.minutes_debited;
+            """,
+            (session_id, bank_name.lower(), minutes),
+            commit=True,
+        )
+
+    def get_session_bank_debits(self, session_id: int) -> dict[str, int]:
+        rows = self._execute(
+            "SELECT bank_name, minutes_debited FROM session_bank_debits WHERE session_id = ?;",
+            (session_id,),
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
     def get_active_session(self, child_id: str) -> ActiveSession | None:
         """Get the active session (session_id, start_time, minutes_granted) for a child if one exists."""
         row = self._execute(
@@ -270,59 +322,26 @@ class PlaytimeStore:
 
         return (row[0], datetime.fromisoformat(row[1]), row[2])
 
-    def get_playtime_minutes_in_window(
-        self,
-        child_id: str,
-        window_start: datetime,
-        window_end: datetime,
-    ) -> int:
-        """Return used or committed session minutes overlapping a time window."""
-        rows = self._execute(
-            """
-            SELECT start_time_iso, end_time_iso, minutes_granted, completed
-            FROM sessions
-            WHERE child_id = ?;
-            """,
-            (child_id,),
-            child_id=child_id,
-        ).fetchall()
-        total = 0
-        for start_iso, end_iso, minutes_granted, completed in rows:
-            start = _parse_stored_datetime(start_iso)
-            scheduled_end = start + timedelta(minutes=minutes_granted)
-            end = _parse_stored_datetime(end_iso) if completed and end_iso else scheduled_end
-            overlap_start = max(start, window_start)
-            overlap_end = min(end, scheduled_end, window_end)
-            if overlap_end > overlap_start:
-                total += int((overlap_end - overlap_start).total_seconds() / 60)
-        return total
-
     def upsert_rule_profile(self, profile: RuleProfile) -> None:
         self._execute(
             """
             INSERT INTO rule_profiles (
                 profile_name,
-                weekly_addition_minutes,
-                weekly_max_minutes,
-                max_bank_minutes,
+                banks_json,
                 accrued_playtime_max_minutes,
                 break_recovery_rate,
                 blackout_periods_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(profile_name) DO UPDATE SET
-                weekly_addition_minutes = excluded.weekly_addition_minutes,
-                weekly_max_minutes = excluded.weekly_max_minutes,
-                max_bank_minutes = excluded.max_bank_minutes,
+                banks_json = excluded.banks_json,
                 accrued_playtime_max_minutes = excluded.accrued_playtime_max_minutes,
                 break_recovery_rate = excluded.break_recovery_rate,
                 blackout_periods_json = excluded.blackout_periods_json;
             """,
             (
                 profile.name,
-                profile.weekly_addition_minutes,
-                profile.weekly_max_minutes,
-                profile.max_bank_minutes,
+                self._serialize_banks(profile.banks),
                 profile.accrued_playtime_max_minutes,
                 profile.break_recovery_rate,
                 self._serialize_blackout_periods(profile.blackout_periods),
@@ -335,9 +354,7 @@ class PlaytimeStore:
             """
             SELECT
                 profile_name,
-                weekly_addition_minutes,
-                weekly_max_minutes,
-                max_bank_minutes,
+                banks_json,
                 accrued_playtime_max_minutes,
                 break_recovery_rate,
                 blackout_periods_json

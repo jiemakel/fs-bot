@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import count
 import os
+from typing import Any
 
 from family_safety_bot.durations import parse_duration_minutes
 
@@ -20,16 +21,27 @@ class Child:
 
 
 @dataclass(frozen=True)
+class BankProfile:
+    """Rollover and balance limits for one named playtime bank."""
+
+    name: str
+    weekly_addition_minutes: int
+    max_balance_minutes: int
+
+
+@dataclass(frozen=True)
 class RuleProfile:
     """Named playtime rules profile."""
 
     name: str
-    weekly_addition_minutes: int
-    weekly_max_minutes: int
-    max_bank_minutes: int
+    banks: dict[str, BankProfile]
     accrued_playtime_max_minutes: int
     break_recovery_rate: float
     blackout_periods: list[tuple[int, str, str]]
+
+    @property
+    def default_bank(self) -> BankProfile:
+        return next(iter(self.banks.values()))
 
 
 def parse_clock_minutes(value: str) -> int | None:
@@ -76,6 +88,75 @@ def normalize_profile_name(name: str) -> str:
     return normalized
 
 
+def parse_rule_profile_definition(name: str, definition: Any) -> RuleProfile:
+    """Parse a strict JSON-compatible profile definition."""
+    if not isinstance(definition, dict):
+        raise ValueError("Profile definition must be a JSON object.")
+    required_fields = {"banks", "accrued_playtime_max", "break_recovery_rate", "blackouts"}
+    if set(definition) != required_fields:
+        raise ValueError(f"Profile fields must be exactly: {sorted(required_fields)}")
+
+    raw_banks = definition["banks"]
+    if not isinstance(raw_banks, dict) or not raw_banks:
+        raise ValueError("Profile must define at least one bank.")
+    banks: dict[str, BankProfile] = {}
+    bank_fields = {"weekly_addition", "max_balance"}
+    for raw_name, raw_bank in raw_banks.items():
+        if not isinstance(raw_bank, dict) or set(raw_bank) != bank_fields:
+            raise ValueError(f"Bank fields must be exactly: {sorted(bank_fields)}")
+        bank_name = normalize_profile_name(str(raw_name))
+        weekly_minutes = parse_duration_minutes(str(raw_bank["weekly_addition"]))
+        max_minutes = parse_duration_minutes(str(raw_bank["max_balance"]))
+        if weekly_minutes is None or weekly_minutes <= 0:
+            raise ValueError(f"Invalid weekly addition for bank {bank_name!r}.")
+        if max_minutes is None or max_minutes <= 0:
+            raise ValueError(f"Invalid maximum balance for bank {bank_name!r}.")
+        key = bank_name.lower()
+        if key in banks:
+            raise ValueError(f"Duplicate bank name: {bank_name!r}.")
+        banks[key] = BankProfile(bank_name, weekly_minutes, max_minutes)
+
+    accrued_max = parse_duration_minutes(str(definition["accrued_playtime_max"]))
+    if accrued_max is None or accrued_max <= 0:
+        raise ValueError("Invalid accrued_playtime_max.")
+    recovery_rate = definition["break_recovery_rate"]
+    if isinstance(recovery_rate, bool) or not isinstance(recovery_rate, (int, float)) or recovery_rate <= 0:
+        raise ValueError("break_recovery_rate must be a positive number.")
+
+    raw_blackouts = definition["blackouts"]
+    if not isinstance(raw_blackouts, list):
+        raise ValueError("blackouts must be an array.")
+    blackout_fields = {"days", "start", "end"}
+    blackout_periods: list[tuple[int, str, str]] = []
+    for raw_blackout in raw_blackouts:
+        if not isinstance(raw_blackout, dict) or set(raw_blackout) != blackout_fields:
+            raise ValueError(f"Blackout fields must be exactly: {sorted(blackout_fields)}")
+        days = raw_blackout["days"]
+        if not isinstance(days, list) or not days:
+            raise ValueError("Each blackout must contain at least one day.")
+        start = str(raw_blackout["start"])
+        end = str(raw_blackout["end"])
+        for day in days:
+            day_key = str(day).lower()
+            if day_key not in WEEKDAY_NAME_TO_INDEX:
+                raise ValueError(f"Invalid blackout day: {day!r}.")
+            blackout_periods.extend(
+                parse_day_blackout_periods(
+                    f"{start}-{end}",
+                    WEEKDAY_NAME_TO_INDEX[day_key],
+                    "profile JSON",
+                )
+            )
+
+    return RuleProfile(
+        name=normalize_profile_name(name),
+        banks=banks,
+        accrued_playtime_max_minutes=accrued_max,
+        break_recovery_rate=float(recovery_rate),
+        blackout_periods=blackout_periods,
+    )
+
+
 @dataclass(frozen=True)
 class Settings:
     # Microsoft Family Safety credentials
@@ -87,19 +168,13 @@ class Settings:
     signal_admins: list[str]  # List of admin phone numbers
     signal_group_id: str  # Signal group ID where all communication happens
 
-    # Default profile from .env. Also used as template for newly created profiles.
-    default_rule_profile: RuleProfile
+    # Optional programmatic bootstrap profile. Environment configuration leaves this unset.
+    default_rule_profile: RuleProfile | None
     
     # General settings
     timezone: str
     data_dir: str
     bot_language: str = "en"
-
-    @staticmethod
-    def _parse_duration_minutes(value: str, env_key: str) -> int:
-        if minutes := parse_duration_minutes(value):
-            return minutes
-        raise ValueError(f"Invalid duration for {env_key}: {value!r}")
 
     @staticmethod
     def _parse_admins_from_env() -> list[str]:
@@ -127,15 +202,6 @@ class Settings:
         return children
 
     @staticmethod
-    def _parse_blackout_periods_from_env() -> list[tuple[int, str, str]]:
-        return [
-            period
-            for weekday, suffix in enumerate(WEEKDAY_SUFFIXES)
-            if (day_periods := os.environ.get(f"BLACKOUT_PERIOD_{suffix}", ""))
-            for period in parse_day_blackout_periods(day_periods, weekday, f"BLACKOUT_PERIOD_{suffix}")
-        ]
-
-    @staticmethod
     def from_env() -> "Settings":
         env = os.environ
         children = Settings._parse_children_from_env()
@@ -149,23 +215,13 @@ class Settings:
         if not children:
             raise ValueError("At least one child is required")
 
-        # Duration strings are external; RuleProfile stores minutes.
         return Settings(
             ms_family_email=env.get("MS_FAMILY_EMAIL", ""),
             ms_family_password=env.get("MS_FAMILY_PASSWORD", ""),
             children=children,
             signal_admins=signal_admins,
             signal_group_id=signal_group_id,
-            default_rule_profile=RuleProfile(
-                name=normalize_profile_name(env.get("RULE_PROFILE_DEFAULT_NAME", "default")),
-                weekly_addition_minutes=Settings._parse_duration_minutes(env.get("WEEKLY_ADDITION_TIME", "14h"), "WEEKLY_ADDITION_TIME"),
-                weekly_max_minutes=Settings._parse_duration_minutes(env.get("WEEKLY_MAX_TIME", "30h"), "WEEKLY_MAX_TIME"),
-                max_bank_minutes=Settings._parse_duration_minutes(env.get("MAX_BANK_TIME", "42h"), "MAX_BANK_TIME"),
-                # This also caps a single playtime request.
-                accrued_playtime_max_minutes=Settings._parse_duration_minutes(env.get("ACCRUED_PLAYTIME_MAX_TIME", "3h"), "ACCRUED_PLAYTIME_MAX_TIME"),
-                break_recovery_rate=float(env.get("BREAK_RECOVERY_RATE", "3.0")),
-                blackout_periods=Settings._parse_blackout_periods_from_env(),
-            ),
+            default_rule_profile=None,
             timezone=env.get("TZ", "Europe/Helsinki"),
             data_dir=env.get("DATA_DIR", "./data"),
             bot_language=env.get("BOT_LANGUAGE", "en"),

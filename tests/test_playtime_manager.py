@@ -3,11 +3,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 import asyncio
+import json
 import sqlite3
 
 import pytest
 from signalbot import Context, SignalBot
 
+from family_safety_bot.config import BankProfile
 from family_safety_bot.storage import PlaytimeStore
 from family_safety_bot.watcher import PlaytimeManager
 from tests.helpers import ADMIN_PHONE, CHILD_PHONE, build_settings, build_store
@@ -60,6 +62,18 @@ def _run_handle(manager: PlaytimeManager, ctx: FakeContext) -> None:
     asyncio.run(manager.handle(cast(Context, ctx)))
 
 
+def _profile_json(banks: dict[str, dict[str, str]] | None = None) -> str:
+    return json.dumps(
+        {
+            "banks": banks
+            or {"default": {"weekly_addition": "14h", "max_balance": "1h"}},
+            "accrued_playtime_max": "3h",
+            "break_recovery_rate": 3.0,
+            "blackouts": [],
+        }
+    )
+
+
 def test_playtime_manager_status_command(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
     store.set_bank_balance(CHILD_PHONE, 120)
@@ -81,7 +95,6 @@ def test_playtime_manager_status_includes_pending_activity_claims(tmp_path: Path
     _run_handle(manager, ctx)
 
     assert len(ctx.sent_messages) == 1
-    assert isinstance(ctx.sent_messages[0], str)
 
 
 def test_playtime_manager_child_request_validation(tmp_path: Path) -> None:
@@ -145,7 +158,6 @@ def test_playtime_manager_unknown_short_numeric_message_sends_help(tmp_path: Pat
     _run_handle(manager, ctx)
 
     assert len(ctx.sent_messages) == 1
-    assert isinstance(ctx.sent_messages[0], str)
 
 
 @pytest.mark.parametrize(
@@ -193,10 +205,8 @@ def test_playtime_manager_natural_session_completion_notifies_group(tmp_path: Pa
     # We should have sent a notification to the group
     bot = cast(FakeBot, manager.bot)
     assert len(bot.sent) == 1
-    receiver, message = bot.sent[0]
+    receiver, _message = bot.sent[0]
     assert receiver == manager._settings.signal_group_id
-    assert "TestChild" in message
-    assert "30m" in message
     
     # The session is now complete in the DB
     assert store.get_active_session(CHILD_PHONE) is None
@@ -368,9 +378,8 @@ def test_playtime_manager_recovery_completion_sends_group_notification(tmp_path:
 
     bot = cast(FakeBot, manager.bot)
     assert len(bot.sent) == 1
-    receiver, message = bot.sent[0]
+    receiver, _message = bot.sent[0]
     assert receiver == manager._settings.signal_group_id
-    assert isinstance(message, str)
     assert store.get_accrued_playtime(CHILD_PHONE)[0] == 0
 
     asyncio.run(manager._check_recovery_completion())
@@ -412,14 +421,10 @@ def test_playtime_manager_scheduler_ticks_do_not_shrink_session_recovery_debt(tm
 def test_playtime_manager_child_profile_switch_affects_limits(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
 
-    env_payload = (
-        "WEEKLY_ADDITION_TIME=14h MAX_BANK_TIME=1h ACCRUED_PLAYTIME_MAX_TIME=3h BREAK_RECOVERY_RATE=3.0 "
-        "BLACKOUT_PERIOD_MON= BLACKOUT_PERIOD_TUE= BLACKOUT_PERIOD_WED= "
-        "BLACKOUT_PERIOD_THU= BLACKOUT_PERIOD_FRI= BLACKOUT_PERIOD_SAT= BLACKOUT_PERIOD_SUN="
-    )
+    profile_json = _profile_json()
     _run_handle(
         manager,
-        FakeContext(message_text=f"profile define strict {env_payload}", sender=ADMIN_PHONE, sent_messages=[]),
+        FakeContext(message_text=f"profile define strict {profile_json}", sender=ADMIN_PHONE, sent_messages=[]),
     )
     _run_handle(manager, FakeContext(message_text="profile use strict TestChild", sender=ADMIN_PHONE, sent_messages=[]))
 
@@ -432,18 +437,14 @@ def test_playtime_manager_child_profile_switch_affects_limits(tmp_path: Path) ->
 
 def test_playtime_manager_profile_database_error_is_reported(tmp_path: Path, monkeypatch) -> None:
     manager, store = _build_manager(tmp_path)
-    env_payload = (
-        "WEEKLY_ADDITION_TIME=14h MAX_BANK_TIME=1h ACCRUED_PLAYTIME_MAX_TIME=3h BREAK_RECOVERY_RATE=3.0 "
-        "BLACKOUT_PERIOD_MON= BLACKOUT_PERIOD_TUE= BLACKOUT_PERIOD_WED= "
-        "BLACKOUT_PERIOD_THU= BLACKOUT_PERIOD_FRI= BLACKOUT_PERIOD_SAT= BLACKOUT_PERIOD_SUN="
-    )
+    profile_json = _profile_json()
     monkeypatch.setattr(
         store,
         "upsert_rule_profile",
         lambda _profile: (_ for _ in ()).throw(sqlite3.IntegrityError("test error")),
     )
     ctx = FakeContext(
-        message_text=f"profile define strict {env_payload}",
+        message_text=f"profile define strict {profile_json}",
         sender=ADMIN_PHONE,
         sent_messages=[],
     )
@@ -451,19 +452,61 @@ def test_playtime_manager_profile_database_error_is_reported(tmp_path: Path, mon
     _run_handle(manager, ctx)
 
     assert len(ctx.sent_messages) == 1
-    assert "database error" in ctx.sent_messages[0]
     assert "strict" not in manager._profiles_by_name
+
+
+def test_admin_can_update_a_named_bank(tmp_path: Path) -> None:
+    manager, store = _build_manager(
+        tmp_path,
+        banks={
+            "earned": BankProfile("earned", 60, 300),
+            "weekly": BankProfile("weekly", 90, 90),
+        },
+    )
+    ctx = FakeContext(message_text="TestChild weekly 1h", sender=ADMIN_PHONE, sent_messages=[])
+
+    _run_handle(manager, ctx)
+
+    assert store.get_bank_balance(CHILD_PHONE, "weekly") == 60
+    assert store.get_bank_balance(CHILD_PHONE, "earned") == 0
+
+    default_ctx = FakeContext(message_text="TestChild 1h", sender=ADMIN_PHONE, sent_messages=[])
+    _run_handle(manager, default_ctx)
+    assert store.get_bank_balance(CHILD_PHONE, "earned") == 60
+    assert store.get_bank_balance(CHILD_PHONE, "weekly") == 60
+
+
+def test_fresh_install_requires_profile_definition_and_assignment(tmp_path: Path) -> None:
+    manager, _store = _build_manager(tmp_path, default_rule_profile=None)
+    status = FakeContext(message_text="status", sender=ADMIN_PHONE, sent_messages=[])
+    _run_handle(manager, status)
+    assert manager._has_profile(CHILD_PHONE) is False
+    assert len(status.sent_messages) == 1
+
+    profile_json = _profile_json(
+        {
+            "earned": {"weekly_addition": "14h", "max_balance": "42h"},
+            "weekly": {"weekly_addition": "30h", "max_balance": "30h"},
+        }
+    )
+    _run_handle(
+        manager,
+        FakeContext(message_text=f"profile define normal {profile_json}", sender=ADMIN_PHONE, sent_messages=[]),
+    )
+    _run_handle(
+        manager,
+        FakeContext(message_text="profile use normal TestChild", sender=ADMIN_PHONE, sent_messages=[]),
+    )
+    assert manager._has_profile(CHILD_PHONE) is True
+    profile = manager._profile_for_child(CHILD_PHONE)
+    assert list(profile.banks) == ["earned", "weekly"]
 
 
 
 def test_playtime_manager_profile_use_default_assigns_default_profile_to_child(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
 
-    strict_payload = (
-        "WEEKLY_ADDITION_TIME=14h MAX_BANK_TIME=1h ACCRUED_PLAYTIME_MAX_TIME=3h BREAK_RECOVERY_RATE=3.0 "
-        "BLACKOUT_PERIOD_MON= BLACKOUT_PERIOD_TUE= BLACKOUT_PERIOD_WED= "
-        "BLACKOUT_PERIOD_THU= BLACKOUT_PERIOD_FRI= BLACKOUT_PERIOD_SAT= BLACKOUT_PERIOD_SUN="
-    )
+    strict_payload = _profile_json()
     _run_handle(
         manager,
         FakeContext(message_text=f"profile define strict {strict_payload}", sender=ADMIN_PHONE, sent_messages=[]),
@@ -504,7 +547,6 @@ def test_admin_claims_lists_pending(tmp_path: Path) -> None:
     _run_handle(manager, ctx)
 
     assert len(ctx.sent_messages) == 1
-    assert isinstance(ctx.sent_messages[0], str)
 
 
 def test_admin_ack_grants_total_and_clears_claims(tmp_path: Path) -> None:

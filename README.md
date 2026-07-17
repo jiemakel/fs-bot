@@ -4,11 +4,11 @@ Signal group bot for managing children’s playtime with rule-based decisions an
 
 ## Overview
 
-The bot is built around a research-informed playtime economy. Each child starts the week with a base allowance of playtime. From there, they can earn additional time through real-world activity, such as going outside for an hour and receiving a larger amount of playtime as a reward. This encourages healthy habits while giving children agency over how they spend their leisure time.
+The bot is built around a research-informed playtime economy. Profiles define one or more named time banks with independent weekly additions and maximum balances. A child needs enough time in every bank to play. Activity rewards go to the profile's first bank, allowing setups such as a long-term earned-time bank combined with a weekly allowance bank.
 
 To keep play sessions balanced, the bot enforces a cap on the maximum length of continuous play. After reaching the continuous-play limit, a child needs to take a break before earning more playtime. Configurable blackout periods can create daily no-play windows, full rest days, or a predictable rhythm for when playtime is available.
 
-Day to day, Playtime Bot runs in a shared Signal group. Children request playtime with messages like `30m`; the bot checks bank balance, blackout windows, active sessions, and break rules, then grants screen time through Microsoft Family Safety when the request is allowed. Admins can approve activity claims, adjust balances, switch profiles, end sessions, or block grants directly from the group.
+Day to day, Playtime Bot runs in a shared Signal group. Children request playtime with messages like `30m`; the bot checks every active bank, blackout windows, active sessions, and break rules, then grants screen time through Microsoft Family Safety when the request is allowed. Admins can approve activity claims, adjust named balances, switch profiles, end sessions, or block grants directly from the group.
 
 ## Docker Compose Setup
 
@@ -63,24 +63,31 @@ DATA_DIR=./data
 BOT_LANGUAGE=en
 ```
 
-Optional rule settings in `.env` control the weekly bank addition, weekly spending allowance, max bank, continuous-play cap, recovery rate, and blackout windows:
-
-```env
-WEEKLY_ADDITION_TIME=14h
-WEEKLY_MAX_TIME=30h
-MAX_BANK_TIME=42h
-ACCRUED_PLAYTIME_MAX_TIME=3h
-BREAK_RECOVERY_RATE=3.0
-BLACKOUT_PERIOD_MON=00:00-08:00,20:30-24:00
-```
-
-Use `BLACKOUT_PERIOD_TUE` through `BLACKOUT_PERIOD_SUN` for the other days. Use `00:00-24:00` to block a full day.
+Rule profiles are created through admin commands, not environment settings. A fresh installation will not grant playtime until an admin defines and assigns a profile. Profiles contain one or more named banks; every bank must fund a playtime request. The first bank is where activity rewards and bank commands go by default.
 
 6. Start the full stack:
 
 ```bash
 docker compose up -d
 docker compose logs -f playtime-bot
+```
+
+Then define and assign a profile in Signal. This example recreates a long-term earned-time bank plus a 30-hour weekly allowance:
+
+```text
+profile define normal {
+  "banks": {
+    "earned": {"weekly_addition": "14h", "max_balance": "42h"},
+    "weekly": {"weekly_addition": "30h", "max_balance": "30h"}
+  },
+  "accrued_playtime_max": "3h",
+  "break_recovery_rate": 3.0,
+  "blackouts": [
+    {"days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"], "start": "00:00", "end": "08:00"},
+    {"days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"], "start": "20:30", "end": "24:00"}
+  ]
+}
+profile use normal Alice
 ```
 
 Bot data is persisted in `./data`; the linked Signal identity is persisted in the `signal-cli-data` Docker volume. The Signal REST API is exposed on local port `8080`; keep it private, because anyone who can reach it can send messages as the linked Signal account.

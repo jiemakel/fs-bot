@@ -7,7 +7,7 @@ from typing import Callable
 
 from dateutil import tz
 
-from family_safety_bot.config import RuleProfile, Settings, parse_clock_minutes
+from family_safety_bot.config import BankProfile, RuleProfile, Settings, parse_clock_minutes
 from family_safety_bot.formatting import format_duration
 from family_safety_bot.i18n import I18n
 from family_safety_bot.storage import ActiveSession, PlaytimeStore
@@ -32,9 +32,7 @@ class PlaytimeDecision:
 class RuntimeState:
     """Precomputed runtime state used by rule evaluation/grant/status paths."""
 
-    bank_balance: int
-    weekly_playtime_used: int
-    weekly_playtime_remaining: int
+    bank_balances: dict[str, int]
     accrued_playtime: int
     rest_accumulated: float
     active_remaining: int
@@ -49,7 +47,7 @@ class RecoveryCompletion:
 
 
 class PlaytimeRules:
-    """Enforce playtime rules and manage weekly allowances for a specific child."""
+    """Enforce playtime rules and manage named banks for a specific child."""
     
     def __init__(
         self,
@@ -101,64 +99,59 @@ class PlaytimeRules:
         overlap_sec = (play_end - max(last_update, start_time)).total_seconds()
         return (max(0, int(overlap_sec / 60)), play_end)
 
-    def _current_week_start(self, now: datetime) -> datetime:
-        return (now - timedelta(days=now.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-
-    def _weekly_playtime_used(self, now: datetime) -> int:
-        week_start = self._current_week_start(now)
-        return self._store.get_playtime_minutes_in_window(
-            self._child_id,
-            week_start,
-            week_start + timedelta(days=7),
-        )
-
-    def _weekly_allowance_line(self, used: int, profile: RuleProfile) -> str:
+    def _bank_balance_line(self, bank: BankProfile, balance: int) -> str:
         return self._i18n.msg(
-            "rules.weekly_allowance",
-            used=format_duration(used),
-            remaining=format_duration(max(0, profile.weekly_max_minutes - used)),
-            maximum=format_duration(profile.weekly_max_minutes),
+            "rules.bank_balance",
+            bank_name=bank.name,
+            balance=format_duration(balance),
+            maximum=format_duration(bank.max_balance_minutes),
+            weekly_addition=format_duration(bank.weekly_addition_minutes),
         )
 
-    def _weekly_allowance_pace_metrics(
+    def _bank_pace_metrics(
         self,
-        weekly_remaining_minutes: int,
+        balance_minutes: int,
+        max_balance_minutes: int,
         now: datetime,
         profile: RuleProfile,
     ) -> tuple[int, float, float, float]:
         playable_days, non_blackout_remaining = self._remaining_playable_window(now, profile)
-        avg_per_day = int(round(weekly_remaining_minutes / playable_days)) if playable_days > 0 else 0
+        avg_per_day = int(round(balance_minutes / playable_days)) if playable_days > 0 else 0
 
         week_non_blackout = self._this_week_non_blackout_minutes(now, profile)
-        allowance_share = (
-            weekly_remaining_minutes / profile.weekly_max_minutes
-            if profile.weekly_max_minutes > 0
-            else 0.0
-        )
+        balance_share = balance_minutes / max_balance_minutes if max_balance_minutes > 0 else 0.0
         non_blackout_share = (non_blackout_remaining / week_non_blackout) if week_non_blackout > 0 else 0.0
-        pace_ratio = (allowance_share / non_blackout_share) if non_blackout_share > 0 else 0.0
-        return avg_per_day, allowance_share, non_blackout_share, pace_ratio
+        pace_ratio = (balance_share / non_blackout_share) if non_blackout_share > 0 else 0.0
+        return avg_per_day, balance_share, non_blackout_share, pace_ratio
 
-    def _weekly_allowance_pace_line(
+    def _bank_pace_line(
         self,
-        weekly_remaining_minutes: int,
+        bank: BankProfile,
+        balance_minutes: int,
         now: datetime,
         profile: RuleProfile,
     ) -> str:
-        avg_per_day, allowance_share, non_blackout_share, pace_ratio = self._weekly_allowance_pace_metrics(
-            weekly_remaining_minutes,
+        avg_per_day, balance_share, non_blackout_share, pace_ratio = self._bank_pace_metrics(
+            balance_minutes,
+            bank.max_balance_minutes,
             now,
             profile,
         )
         return self._i18n.msg(
-            "rules.status_weekly_allowance_avg_pace",
+            "rules.status_bank_avg_pace",
             avg_per_day=format_duration(avg_per_day),
-            allowance_share=f"{allowance_share * 100:.1f}%",
+            balance_share=f"{balance_share * 100:.1f}%",
             non_blackout_share=f"{non_blackout_share * 100:.1f}%",
             pace_ratio=f"{pace_ratio:.2f}x",
         )
+
+    def _bank_status_lines(self, balances: dict[str, int], now: datetime, profile: RuleProfile) -> list[str]:
+        lines: list[str] = []
+        for key, bank in profile.banks.items():
+            balance = balances[key]
+            lines.append(self._bank_balance_line(bank, balance))
+            lines.append(self._bank_pace_line(bank, balance, now, profile))
+        return lines
 
     def _update_accrued_playtime(
         self,
@@ -322,17 +315,14 @@ class PlaytimeRules:
             active_remaining = max(0, minutes_granted - self._elapsed_minutes(start_time, now))
         else:
             active_remaining = 0
-        bank_balance = self._store.get_bank_balance(self._child_id)
-        weekly_playtime_used = self._weekly_playtime_used(now)
+        bank_balances = self._store.get_bank_balances(self._child_id, list(profile.banks))
         accrued_playtime, last_update, rest_accumulated = self._store.get_accrued_playtime(self._child_id)
         if active:
             # Include active elapsed time for decisions/status without making scheduler cadence affect stored debt.
             accrued_playtime += self._active_play_overlap(active, last_update, now)[0]
             rest_accumulated = 0.0
         return RuntimeState(
-            bank_balance=bank_balance,
-            weekly_playtime_used=weekly_playtime_used,
-            weekly_playtime_remaining=max(0, profile.weekly_max_minutes - weekly_playtime_used),
+            bank_balances=bank_balances,
             accrued_playtime=accrued_playtime,
             rest_accumulated=rest_accumulated,
             active_remaining=active_remaining,
@@ -343,17 +333,17 @@ class PlaytimeRules:
     def _max_target_minutes_from_now(
         self,
         active_remaining: int,
-        bank_balance: int,
+        bank_balances: dict[str, int],
         effective_playtime_load: int,
-        weekly_playtime_remaining: int,
         profile: RuleProfile,
         minutes_until_blackout: int | None,
     ) -> int:
         """Return max request target (minutes from now) after all caps."""
         playtime_room = profile.accrued_playtime_max_minutes - effective_playtime_load
+        bank_room = min(bank_balances.values(), default=0)
         max_target_from_now = active_remaining + max(
             0,
-            min(bank_balance, playtime_room, weekly_playtime_remaining),
+            min(bank_room, playtime_room),
         )
         if minutes_until_blackout is not None:
             max_target_from_now = min(max_target_from_now, minutes_until_blackout)
@@ -365,8 +355,7 @@ class PlaytimeRules:
         granted_minutes: int,
         state: RuntimeState,
         profile: RuleProfile,
-        bank_capacity: int,
-        weekly_capacity: int,
+        bank_capacities: dict[str, int],
         accrued_playtime_capacity: int,
         blackout_capacity: int | None,
     ) -> str:
@@ -381,23 +370,15 @@ class PlaytimeRules:
             )
         ]
 
-        if requested_minutes > bank_capacity:
-            lines.append(
-                self._i18n.msg(
-                    "rules.partial_grant_reason_bank",
-                    available=format_duration(bank_capacity),
+        for bank_name, capacity in bank_capacities.items():
+            if requested_minutes > capacity:
+                lines.append(
+                    self._i18n.msg(
+                        "rules.partial_grant_reason_bank",
+                        bank_name=profile.banks[bank_name].name,
+                        available=format_duration(capacity),
+                    )
                 )
-            )
-
-        if requested_minutes > weekly_capacity:
-            lines.append(
-                self._i18n.msg(
-                    "rules.partial_grant_reason_weekly",
-                    available=format_duration(weekly_capacity),
-                    used=format_duration(state.weekly_playtime_used),
-                    maximum=format_duration(profile.weekly_max_minutes),
-                )
-            )
 
         if requested_minutes > accrued_playtime_capacity:
             lines.append(
@@ -452,19 +433,17 @@ class PlaytimeRules:
                 ),
             )
         
-        if state.bank_balance <= 0 and requested_minutes > state.active_remaining:
-            return PlaytimeDecision(
-                allowed=False,
-                reason=self._i18n.msg("rules.bank_empty_denied"),
-            )
-
-        if state.weekly_playtime_remaining <= 0 and requested_minutes > state.active_remaining:
+        empty_banks = [
+            profile.banks[name].name
+            for name, balance in state.bank_balances.items()
+            if balance <= 0
+        ]
+        if empty_banks and requested_minutes > state.active_remaining:
             return PlaytimeDecision(
                 allowed=False,
                 reason=self._i18n.msg(
-                    "rules.weekly_maxed_denied",
-                    used=format_duration(state.weekly_playtime_used),
-                    maximum=format_duration(profile.weekly_max_minutes),
+                    "rules.bank_empty_denied",
+                    bank_names=", ".join(empty_banks),
                 ),
             )
 
@@ -480,17 +459,18 @@ class PlaytimeRules:
                 ),
             )
         
-        bank_capacity = state.active_remaining + max(0, state.bank_balance)
-        weekly_capacity = state.active_remaining + state.weekly_playtime_remaining
+        bank_capacities = {
+            name: state.active_remaining + max(0, balance)
+            for name, balance in state.bank_balances.items()
+        }
         accrued_playtime_capacity = state.active_remaining + max(0, profile.accrued_playtime_max_minutes - state.effective_playtime_load)
         blackout_capacity = self._minutes_until_next_blackout(now, profile)
         minutes_to_grant = min(
             max(0, requested_minutes),
             self._max_target_minutes_from_now(
                 active_remaining=state.active_remaining,
-                bank_balance=state.bank_balance,
+                bank_balances=state.bank_balances,
                 effective_playtime_load=state.effective_playtime_load,
-                weekly_playtime_remaining=state.weekly_playtime_remaining,
                 profile=profile,
                 minutes_until_blackout=blackout_capacity,
             ),
@@ -498,9 +478,10 @@ class PlaytimeRules:
 
         cannot_grant_now_reason = self._i18n.msg(
             "rules.cannot_grant_now",
-            bank=format_duration(state.bank_balance),
-            weekly_used=format_duration(state.weekly_playtime_used),
-            weekly_max=format_duration(profile.weekly_max_minutes),
+            banks=", ".join(
+                f"{profile.banks[name].name} {format_duration(balance)}"
+                for name, balance in state.bank_balances.items()
+            ),
             accrued_playtime=format_duration(state.effective_playtime_load),
             accrued_max=format_duration(profile.accrued_playtime_max_minutes),
         )
@@ -517,8 +498,7 @@ class PlaytimeRules:
                 granted_minutes=minutes_to_grant,
                 state=state,
                 profile=profile,
-                bank_capacity=bank_capacity,
-                weekly_capacity=weekly_capacity,
+                bank_capacities=bank_capacities,
                 accrued_playtime_capacity=accrued_playtime_capacity,
                 blackout_capacity=blackout_capacity,
             ),
@@ -536,9 +516,13 @@ class PlaytimeRules:
         state = self._load_runtime_state(now, profile)
         additional_minutes = max(0, minutes - state.active_remaining)
 
-        # Deduct only additional time beyond current remaining session time.
-        new_bank = state.bank_balance - additional_minutes
-        self._store.set_bank_balance(self._child_id, new_bank)
+        # Deduct only additional time beyond current remaining session time from every bank.
+        new_balances = {
+            name: balance - additional_minutes
+            for name, balance in state.bank_balances.items()
+        }
+        for name, balance in new_balances.items():
+            self._store.set_bank_balance(self._child_id, balance, name)
         accrued_playtime = state.accrued_playtime
 
         # Detect recovery abort: starting a NEW session while mid-recovery.
@@ -559,28 +543,19 @@ class PlaytimeRules:
         else:
             self._store.set_accrued_playtime(self._child_id, state.accrued_playtime, now, 0.0)
             session_id = self._store.add_session(self._child_id, now, minutes)
+        for bank_name in profile.banks:
+            self._store.add_session_bank_debit(session_id, bank_name, additional_minutes)
 
         lines = [self._i18n.msg("rules.grant_confirm", minutes=format_duration(minutes))]
         if state.active_session is not None:
             lines.append(self._i18n.msg("rules.added_now", minutes=format_duration(additional_minutes)))
-        lines.extend(
-            [
-                self._i18n.msg(
-                    "rules.bank_remaining",
-                    minutes=format_duration(new_bank),
-                ),
-                self._weekly_allowance_line(self._weekly_playtime_used(now), profile),
-                self._weekly_allowance_pace_line(
-                    max(0, profile.weekly_max_minutes - self._weekly_playtime_used(now)),
-                    now,
-                    profile,
-                ),
-                self._i18n.msg(
-                    "rules.accrued_playtime",
-                    balance=format_duration(accrued_playtime),
-                    max_balance=format_duration(profile.accrued_playtime_max_minutes),
-                ),
-            ]
+        lines.extend(self._bank_status_lines(new_balances, now, profile))
+        lines.append(
+            self._i18n.msg(
+                "rules.accrued_playtime",
+                balance=format_duration(accrued_playtime),
+                max_balance=format_duration(profile.accrued_playtime_max_minutes),
+            )
         )
         if recovery_aborted:
             recovery_needed = self._recovery_minutes(accrued_playtime, profile)
@@ -617,11 +592,13 @@ class PlaytimeRules:
         ended_early = actual_minutes < minutes_granted
         unused = 0
 
-        # If ended early, credit the unused time back to bank
+        # If ended early, credit unused debits back to every bank used by the session.
         if ended_early:
             unused = minutes_granted - actual_minutes
-            bank_balance = self._store.get_bank_balance(self._child_id)
-            self._store.set_bank_balance(self._child_id, bank_balance + unused)
+            for bank_name, debited in self._store.get_session_bank_debits(session_id).items():
+                refund = min(unused, debited)
+                bank_balance = self._store.get_bank_balance(self._child_id, bank_name)
+                self._store.set_bank_balance(self._child_id, bank_balance + refund, bank_name)
         
         # Mark session complete
         self._store.complete_session(session_id, now)
@@ -648,7 +625,8 @@ class PlaytimeRules:
                 "rules.recovery_restored",
                 rest_done=format_duration(int(restored_rest_accumulated)),
             )
-        message += "\n" + self._weekly_allowance_line(self._weekly_playtime_used(now), profile)
+        balances = self._store.get_bank_balances(self._child_id, list(profile.banks))
+        message += "\n" + "\n".join(self._bank_status_lines(balances, now, profile))
         
         return message
 
@@ -676,13 +654,7 @@ class PlaytimeRules:
         lines = [
             self._i18n.msg("rules.status_title"),
             "",
-            self._i18n.msg(
-                "rules.status_bank_total_max",
-                total=format_duration(state.bank_balance),
-                max_balance=format_duration(profile.max_bank_minutes),
-            ),
-            self._weekly_allowance_line(state.weekly_playtime_used, profile),
-            self._weekly_allowance_pace_line(state.weekly_playtime_remaining, now, profile),
+            *self._bank_status_lines(state.bank_balances, now, profile),
             self._i18n.msg(
                 "rules.status_accrued_playtime",
                 balance=format_duration(state.accrued_playtime),
@@ -695,9 +667,8 @@ class PlaytimeRules:
         minutes_until_blackout = self._minutes_until_next_blackout(now, profile)
         max_target_from_now = self._max_target_minutes_from_now(
             active_remaining=state.active_remaining,
-            bank_balance=state.bank_balance,
+            bank_balances=state.bank_balances,
             effective_playtime_load=state.effective_playtime_load,
-            weekly_playtime_remaining=state.weekly_playtime_remaining,
             profile=profile,
             minutes_until_blackout=minutes_until_blackout,
         )
@@ -764,62 +735,87 @@ class PlaytimeRules:
         
         return "\n".join(lines)
 
-    def add_to_bank(self, minutes: int) -> str:
-        """Add minutes to the bank (admin function)."""
-        now = self._get_local_now()
+    def add_to_bank(self, minutes: int, bank_name: str | None = None) -> str:
+        """Add minutes to one named bank (admin/activity function)."""
         profile = self._profile()
-        actual_added = self._store.add_to_bank(self._child_id, minutes, profile.max_bank_minutes)
-        bank_balance = self._store.get_bank_balance(self._child_id)
+        bank = profile.default_bank if bank_name is None else profile.banks.get(bank_name.lower())
+        if bank is None:
+            return self._i18n.msg(
+                "rules.bank_unknown",
+                bank_name=bank_name or "",
+                bank_names=", ".join(item.name for item in profile.banks.values()),
+            )
+        actual_added = self._store.add_to_bank(
+            self._child_id,
+            minutes,
+            bank.max_balance_minutes,
+            bank.name,
+        )
+        bank_balance = self._store.get_bank_balance(self._child_id, bank.name)
         return self._i18n.msg(
             "rules.add_to_bank",
+            bank_name=bank.name,
             actual_added=format_duration(actual_added),
             bank=format_duration(bank_balance),
-            max_bank=format_duration(profile.max_bank_minutes),
-            weekly_remaining=format_duration(max(0, profile.weekly_max_minutes - self._weekly_playtime_used(now))),
-            weekly_max=format_duration(profile.weekly_max_minutes),
+            max_bank=format_duration(bank.max_balance_minutes),
         )
 
-    def set_bank(self, minutes: int) -> str:
-        """Set bank to an explicit value in minutes (admin function)."""
-        now = self._get_local_now()
+    def set_bank(self, minutes: int, bank_name: str | None = None) -> str:
+        """Set one named bank to an explicit value in minutes."""
         profile = self._profile()
-        capped_minutes = max(0, min(minutes, profile.max_bank_minutes))
-        old_balance = self._store.get_bank_balance(self._child_id)
-        self._store.set_bank_balance(self._child_id, capped_minutes)
+        bank = profile.default_bank if bank_name is None else profile.banks.get(bank_name.lower())
+        if bank is None:
+            return self._i18n.msg(
+                "rules.bank_unknown",
+                bank_name=bank_name or "",
+                bank_names=", ".join(item.name for item in profile.banks.values()),
+            )
+        capped_minutes = max(0, min(minutes, bank.max_balance_minutes))
+        old_balance = self._store.get_bank_balance(self._child_id, bank.name)
+        self._store.set_bank_balance(self._child_id, capped_minutes, bank.name)
         message = self._i18n.msg(
             "rules.set_bank",
+            bank_name=bank.name,
             old_balance=format_duration(old_balance),
             new_balance=format_duration(capped_minutes),
-            max_bank=format_duration(profile.max_bank_minutes),
-            weekly_remaining=format_duration(max(0, profile.weekly_max_minutes - self._weekly_playtime_used(now))),
-            weekly_max=format_duration(profile.weekly_max_minutes),
+            max_bank=format_duration(bank.max_balance_minutes),
         )
         if capped_minutes != minutes:
             message += self._i18n.msg("rules.set_bank_capped")
         return message
 
-    def modify_bank(self, delta_minutes: int) -> str:
-        """Adjust bank by a relative delta in minutes (admin function)."""
-        current_balance = self._store.get_bank_balance(self._child_id)
-        return self.set_bank(current_balance + delta_minutes)
+    def modify_bank(self, delta_minutes: int, bank_name: str | None = None) -> str:
+        """Adjust one named bank by a relative delta in minutes."""
+        profile = self._profile()
+        bank = profile.default_bank if bank_name is None else profile.banks.get(bank_name.lower())
+        if bank is None:
+            return self._i18n.msg(
+                "rules.bank_unknown",
+                bank_name=bank_name or "",
+                bank_names=", ".join(item.name for item in profile.banks.values()),
+            )
+        current_balance = self._store.get_bank_balance(self._child_id, bank.name)
+        return self.set_bank(current_balance + delta_minutes, bank_name)
 
     def rollover_week(self) -> str:
-        """Handle weekly rollover: add weekly allowance to bank (up to limit)."""
-        now = self._get_local_now()
+        """Add each bank's weekly amount, capped at its configured maximum."""
         profile = self._profile()
-        bank_balance = self._store.get_bank_balance(self._child_id)
-        new_bank = min(
-            bank_balance + profile.weekly_addition_minutes,
-            profile.max_bank_minutes
-        )
-        actual_added = new_bank - bank_balance
-        
-        self._store.set_bank_balance(self._child_id, new_bank)
-        return self._i18n.msg(
-            "rules.rollover_week",
-            actual_added=format_duration(actual_added),
-            max_bank=format_duration(profile.max_bank_minutes),
-            new_bank=format_duration(new_bank),
-            weekly_remaining=format_duration(max(0, profile.weekly_max_minutes - self._weekly_playtime_used(now))),
-            weekly_max=format_duration(profile.weekly_max_minutes),
-        )
+        lines = [self._i18n.msg("rules.rollover_week")]
+        for bank in profile.banks.values():
+            old_balance = self._store.get_bank_balance(self._child_id, bank.name)
+            actual_added = self._store.add_to_bank(
+                self._child_id,
+                bank.weekly_addition_minutes,
+                bank.max_balance_minutes,
+                bank.name,
+            )
+            lines.append(
+                self._i18n.msg(
+                    "rules.rollover_bank",
+                    bank_name=bank.name,
+                    actual_added=format_duration(actual_added),
+                    new_bank=format_duration(old_balance + actual_added),
+                    max_bank=format_duration(bank.max_balance_minutes),
+                )
+            )
+        return "\n".join(lines)

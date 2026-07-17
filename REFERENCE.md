@@ -32,13 +32,11 @@ Each child index must include all three values:
 
 Child names are case-insensitive for commands and must be unique after lowercasing.
 
-### Rule Settings
+### Rule Profiles
 
-- `WEEKLY_ADDITION_TIME` - Playtime added during weekly rollover. Default: `14h`.
-- `WEEKLY_MAX_TIME` - Maximum playtime that can be used or committed in one Monday-to-Sunday week. Default: `30h`.
-- `MAX_BANK_TIME` - Maximum banked playtime. Default: `42h`.
-- `ACCRUED_PLAYTIME_MAX_TIME` - Continuous/accrued playtime cap before a break is required. Default: `3h`.
-- `BREAK_RECOVERY_RATE` - Break recovery multiplier. Default: `3.0`, meaning 1 minute of break recovers 3 minutes of accrued playtime.
+Rule settings are stored in profiles created through Signal admin commands. There are no environment defaults. A profile must be defined and assigned before playtime functionality is enabled for a child.
+
+Each profile has one or more named banks. Every bank must have enough balance for a grant, and the granted amount is deducted from every bank. Each bank defines its own weekly addition and maximum balance. Banks are a JSON object, and its first key is the default target for activity claims and balance commands.
 
 Durations accept `h`, `m`, and `min`, including compound and multiplier forms:
 
@@ -52,19 +50,9 @@ Durations accept `h`, `m`, and `min`, including compound and multiplier forms:
 
 Duration-only commands must be only a duration. Text after a duration becomes an activity claim, not a playtime request.
 
-### Blackout Settings
+### Blackout Profile Settings
 
-Use one variable per weekday:
-
-- `BLACKOUT_PERIOD_MON`
-- `BLACKOUT_PERIOD_TUE`
-- `BLACKOUT_PERIOD_WED`
-- `BLACKOUT_PERIOD_THU`
-- `BLACKOUT_PERIOD_FRI`
-- `BLACKOUT_PERIOD_SAT`
-- `BLACKOUT_PERIOD_SUN`
-
-Format each value as comma-separated `HH:MM-HH:MM` ranges. `24:00` is accepted as an end time, and `00:00-24:00` blocks a full day. Ranges must start before they end; overnight windows should be split across two days. Invalid blackout entries fail startup.
+Each item in the profile's `blackouts` array has `days`, `start`, and `end`. `days` accepts `mon` through `sun`, and one item may apply to several days. Times use `HH:MM`; `24:00` is accepted as an end time, and `00:00` to `24:00` blocks a full day. Ranges must start before they end; overnight windows should be split into two entries. Invalid entries reject the entire profile definition.
 
 ### Other Settings
 
@@ -88,41 +76,43 @@ Format each value as comma-separated `HH:MM-HH:MM` ranges. `24:00` is accepted a
 
 - `status` - Show status for all children.
 - `request [name] <duration>` - Run the child request flow as a test command.
-- `[name] <duration>` - Add time to a child's bank.
-- `[name] +<duration>` - Add time explicitly.
-- `[name] -<duration>` - Remove time.
-- `[name] =<duration>` - Set the bank to an exact value.
+- `[name] [bank] <duration>` - Add time; child and bank are optional, and the first profile bank is the default.
+- `[name] [bank] +<duration>` - Add time explicitly.
+- `[name] [bank] -<duration>` - Remove time.
+- `[name] [bank] =<duration>` - Set a bank to an exact value.
 - `end [name]` - End a child's active session.
 - `rollover [name]` - Force weekly rollover.
 - `block [name]` - Enable grant block mode and end any active session.
 - `unblock [name]` - Disable grant block mode.
 - `claims [name]` - List pending activity claims.
-- `ack [name]` - Grant all pending activity claims to the bank.
+- `ack [name]` - Grant all pending activity claims to the profile's first bank.
 - `profile list` - List rule profiles.
 - `profile show <name>` - Show a rule profile.
-- `profile define <name> KEY=VALUE ...` - Create or replace a rule profile using env-style values.
+- `profile define <name> <json>` - Create or replace a rule profile using the JSON structure below.
 - `profile use <profile> <child>` - Assign a profile to one child.
 
 `<name>` is case-insensitive. For commands that accept `[name]`, omitting it applies the command to all children.
 
-### Profile Definition Keys
+### Profile Definition JSON
 
-`profile define` requires:
+The JSON object requires exactly `banks`, `accrued_playtime_max`, `break_recovery_rate`, and `blackouts`. Each bank requires exactly `weekly_addition` and `max_balance`. Object order is significant only for `banks`: the first bank is the activity/default bank.
 
-- `WEEKLY_ADDITION_TIME`
-- `MAX_BANK_TIME`
-- `ACCRUED_PLAYTIME_MAX_TIME`
-- `BREAK_RECOVERY_RATE`
-- `BLACKOUT_PERIOD_MON`
-- `BLACKOUT_PERIOD_TUE`
-- `BLACKOUT_PERIOD_WED`
-- `BLACKOUT_PERIOD_THU`
-- `BLACKOUT_PERIOD_FRI`
-- `BLACKOUT_PERIOD_SAT`
-- `BLACKOUT_PERIOD_SUN`
+```json
+{
+  "banks": {
+    "earned": {"weekly_addition": "14h", "max_balance": "42h"},
+    "weekly": {"weekly_addition": "30h", "max_balance": "30h"}
+  },
+  "accrued_playtime_max": "3h",
+  "break_recovery_rate": 3.0,
+  "blackouts": [
+    {"days": ["mon", "tue", "wed", "thu", "fri"], "start": "00:00", "end": "08:00"},
+    {"days": ["sat", "sun"], "start": "00:00", "end": "09:00"}
+  ]
+}
+```
 
-Use an empty value for a day with no blackout periods, for example `BLACKOUT_PERIOD_SAT=`.
-`WEEKLY_MAX_TIME` is optional in profile definitions and defaults to `30h` when omitted.
+The command accepts whitespace and newlines inside the JSON, so this structure can be pasted directly after `profile define <name>`.
 
 ---
 
@@ -131,9 +121,11 @@ Use an empty value for a day with no blackout periods, for example `BLACKOUT_PER
 - Local state is updated only after a successful Microsoft Family Safety grant.
 - If Microsoft grant/authentication fails, the request is rejected and local state is unchanged.
 - Ending a session first applies an immediate Microsoft block; if that block fails, the session is not ended locally.
-- Partial grants give the maximum currently allowed time when bank, weekly allowance, accrued-playtime, or blackout limits prevent the full request.
-- Activity rewards can grow the bank up to its maximum, but do not increase the weekly spending allowance.
-- Weekly usage includes completed playtime and time committed to an active session; ending early releases the unused portion.
+- Partial grants give the maximum currently allowed time when any bank, accrued-playtime, or blackout limit prevents the full request.
+- Every grant deducts from every bank in the active profile.
+- Activity rewards and unspecified balance commands target the profile's first bank.
+- Ending early returns unused time to every bank debited for that session.
+- Bank balances are stored by child and bank name independently of profiles. Switching profiles preserves them even when a balance exceeds the new maximum; a later rollover may clamp the balance to the active profile's maximum.
 - Activity claims remain pending until an admin runs `ack` or an explicit bank modification.
 - Accrued playtime recovery is granted only when the full required break has completed.
 - If a child briefly interrupts recovery, stopping within the grace window preserves the previous recovery progress.

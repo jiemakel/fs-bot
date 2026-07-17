@@ -4,7 +4,6 @@ import os
 from signalbot import SignalBot, enable_console_logging
 
 from family_safety_bot.config import Settings
-from family_safety_bot.formatting import format_duration
 from family_safety_bot.storage import PlaytimeStore
 from family_safety_bot.watcher import PlaytimeManager
 
@@ -53,11 +52,7 @@ def main() -> None:
     logging.info("  Children:")
     for phone, child in settings.children.items():
         logging.info("    - %s (%s)", child.name, phone)
-    logging.info("  Default profile: %s", settings.default_rule_profile.name)
-    logging.info("  Weekly addition: %s", format_duration(settings.default_rule_profile.weekly_addition_minutes))
-    logging.info("  Max bank: %s", format_duration(settings.default_rule_profile.max_bank_minutes))
-    logging.info("  Accrued playtime max: %s", format_duration(settings.default_rule_profile.accrued_playtime_max_minutes))
-    logging.info("  Break recovery rate: %.1fx", settings.default_rule_profile.break_recovery_rate)
+    logging.info("  Rule profiles are managed through Signal admin commands")
     
     bot.start()
 

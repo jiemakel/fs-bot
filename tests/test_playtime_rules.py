@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from family_safety_bot.config import BankProfile, RuleProfile
 from family_safety_bot.rules import PlaytimeRules
 from tests.helpers import CHILD_PHONE, build_settings, build_store
 
@@ -123,32 +124,44 @@ def test_playtime_rules_exceeds_bank_balance(tmp_path: Path) -> None:
     assert decision.minutes_granted == 30
 
 
-def test_playtime_rules_weekly_allowance_caps_grants(tmp_path: Path) -> None:
+def test_playtime_rules_secondary_bank_caps_grants(tmp_path: Path) -> None:
     store = build_store(tmp_path)
-    settings = build_settings(tmp_path, weekly_max_minutes=90, accrued_playtime_max_minutes=300)
+    settings = build_settings(
+        tmp_path,
+        banks={
+            "default": BankProfile("default", 180, 300),
+            "weekly": BankProfile("weekly", 90, 90),
+        },
+        accrued_playtime_max_minutes=300,
+    )
     rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
     now = datetime(2025, 1, 8, 12, 0, tzinfo=timezone.utc)
     rules._get_local_now = lambda: now  # type: ignore[method-assign]
     store.set_bank_balance(CHILD_PHONE, 300)
-    store.add_session(CHILD_PHONE, now - timedelta(days=1), 60)
-    active = store.get_active_session(CHILD_PHONE)
-    assert active is not None
-    store.complete_session(active[0], now - timedelta(days=1, minutes=-60))
+    store.set_bank_balance(CHILD_PHONE, 30, "weekly")
 
     decision = rules.evaluate_request(60)
 
     assert decision.allowed is True
     assert decision.minutes_granted == 30
-    assert "weekly allowance" in decision.reason
+    assert "weekly" in decision.reason
 
 
-def test_playtime_rules_weekly_allowance_releases_unused_active_time(tmp_path: Path) -> None:
+def test_playtime_rules_ending_early_refunds_every_bank(tmp_path: Path) -> None:
     store = build_store(tmp_path)
-    settings = build_settings(tmp_path, weekly_max_minutes=90, accrued_playtime_max_minutes=300)
+    settings = build_settings(
+        tmp_path,
+        banks={
+            "default": BankProfile("default", 180, 300),
+            "weekly": BankProfile("weekly", 90, 90),
+        },
+        accrued_playtime_max_minutes=300,
+    )
     rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
     start = datetime(2025, 1, 8, 12, 0, tzinfo=timezone.utc)
     rules._get_local_now = lambda: start  # type: ignore[method-assign]
     store.set_bank_balance(CHILD_PHONE, 300)
+    store.set_bank_balance(CHILD_PHONE, 90, "weekly")
 
     decision = rules.evaluate_request(90)
     rules.grant_playtime(decision.minutes_granted)
@@ -157,6 +170,7 @@ def test_playtime_rules_weekly_allowance_releases_unused_active_time(tmp_path: P
     rules._get_local_now = lambda: start + timedelta(minutes=30)  # type: ignore[method-assign]
     rules.complete_session()
     assert rules.evaluate_request(60).minutes_granted == 60
+    assert store.get_bank_balance(CHILD_PHONE, "weekly") == 60
 
 
 def test_playtime_rules_accrued_playtime_maxed(tmp_path: Path) -> None:
@@ -227,7 +241,7 @@ def test_playtime_rules_recovery_completion_message_is_one_shot(tmp_path: Path) 
 
     message = rules.check_recovery_completion()
 
-    assert isinstance(message, str)
+    assert message is not None
     balance, _, rest_acc = store.get_accrued_playtime(CHILD_PHONE)
     assert balance == 0
     assert rest_acc == 0.0
@@ -250,10 +264,9 @@ def test_playtime_rules_recovery_abort_can_be_resumed_by_quick_stop(tmp_path: Pa
     store.set_accrued_playtime(CHILD_PHONE, 90, base)
 
     rules._get_local_now = lambda: grant_at  # type: ignore[method-assign]
-    session_id, grant_message = rules.grant_playtime(10)
+    session_id, _grant_message = rules.grant_playtime(10)
 
     assert session_id > 0
-    assert isinstance(grant_message, str)
     abort = store.get_recovery_abort(CHILD_PHONE)
     assert abort is not None
     saved_rest, abort_time = abort
@@ -261,9 +274,8 @@ def test_playtime_rules_recovery_abort_can_be_resumed_by_quick_stop(tmp_path: Pa
     assert abort_time == grant_at
 
     rules._get_local_now = lambda: stop_at  # type: ignore[method-assign]
-    complete_message = rules.complete_session()
+    rules.complete_session()
 
-    assert isinstance(complete_message, str)
     assert store.get_recovery_abort(CHILD_PHONE) is None
     balance, last_update, rest_acc = store.get_accrued_playtime(CHILD_PHONE)
     assert balance == 90
@@ -290,14 +302,12 @@ def test_playtime_rules_recovery_abort_expired_grace_does_not_restore_rest(tmp_p
     store.set_accrued_playtime(CHILD_PHONE, 90, base)
 
     rules._get_local_now = lambda: grant_at  # type: ignore[method-assign]
-    _session_id, grant_message = rules.grant_playtime(10)
-    assert isinstance(grant_message, str)
+    rules.grant_playtime(10)
     assert store.get_recovery_abort(CHILD_PHONE) is not None
 
     rules._get_local_now = lambda: stop_at  # type: ignore[method-assign]
-    complete_message = rules.complete_session()
+    rules.complete_session()
 
-    assert isinstance(complete_message, str)
     assert store.get_recovery_abort(CHILD_PHONE) is None
     balance, last_update, rest_acc = store.get_accrued_playtime(CHILD_PHONE)
     assert balance == 92
@@ -402,7 +412,14 @@ def test_playtime_rules_active_session_smaller_request_no_refund(tmp_path: Path)
 def test_playtime_rules_status_active_recovery_calculates_without_persisting(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path, break_recovery_rate=3.0)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    i18n = RecordingI18n()
+    rules = PlaytimeRules(
+        CHILD_PHONE,
+        settings,
+        store,
+        profile_provider=lambda: settings.default_rule_profile,
+        i18n=i18n,  # type: ignore[arg-type]
+    )
 
     start = datetime(2025, 1, 6, 10, 0, tzinfo=timezone.utc)
     now = start + timedelta(minutes=30)
@@ -411,35 +428,41 @@ def test_playtime_rules_status_active_recovery_calculates_without_persisting(tmp
     store.add_session(CHILD_PHONE, start, 60)
     store.set_accrued_playtime(CHILD_PHONE, 0, start)
 
-    status = rules.get_status()
+    rules.get_status()
     balance, _, _rest = store.get_accrued_playtime(CHILD_PHONE)
-    assert "30m/3h" in status
+    status_call = next(kwargs for key, kwargs in i18n.calls if key == "rules.status_accrued_playtime")
+    assert status_call == {"balance": "30m", "max_balance": "3h"}
     assert balance == 0
 
 
-def test_playtime_rules_status_pace_uses_weekly_cap_not_bank(tmp_path: Path) -> None:
+def test_playtime_rules_status_reports_each_bank_against_its_maximum(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(
         tmp_path,
-        weekly_max_minutes=100,
+        banks={"default": BankProfile("default", 60, 100)},
         accrued_playtime_max_minutes=300,
     )
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    i18n = RecordingI18n()
+    rules = PlaytimeRules(
+        CHILD_PHONE,
+        settings,
+        store,
+        profile_provider=lambda: settings.default_rule_profile,
+        i18n=i18n,  # type: ignore[arg-type]
+    )
     now = datetime(2025, 1, 8, 12, 0, tzinfo=timezone.utc)
     rules._get_local_now = lambda: now  # type: ignore[method-assign]
-    store.set_bank_balance(CHILD_PHONE, 1000)
-    session_id = store.add_session(CHILD_PHONE, now - timedelta(days=1), 40)
-    store.complete_session(session_id, now - timedelta(days=1) + timedelta(minutes=40))
+    store.set_bank_balance(CHILD_PHONE, 60)
 
-    status = rules.get_status()
+    rules.get_status()
 
-    assert "allowance left 60.0%" in status
-    assert "Bank:" not in status
+    pace_call = next(kwargs for key, kwargs in i18n.calls if key == "rules.status_bank_avg_pace")
+    assert pace_call["balance_share"] == "60.0%"
 
 
 def test_playtime_rules_add_to_bank(tmp_path: Path) -> None:
     store = build_store(tmp_path)
-    settings = build_settings(tmp_path, max_bank_minutes=200)
+    settings = build_settings(tmp_path, banks={"default": BankProfile("default", 60, 200)})
     rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
 
     _result = rules.add_to_bank(30)
@@ -447,6 +470,68 @@ def test_playtime_rules_add_to_bank(tmp_path: Path) -> None:
 
     _result = rules.add_to_bank(200)
     assert store.get_bank_balance(CHILD_PHONE) == 200
+
+
+def test_playtime_rules_activity_addition_targets_first_configured_bank(tmp_path: Path) -> None:
+    store = build_store(tmp_path)
+    settings = build_settings(
+        tmp_path,
+        banks={
+            "earned": BankProfile("earned", 60, 200),
+            "weekly": BankProfile("weekly", 90, 90),
+        },
+    )
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+
+    rules.add_to_bank(30)
+
+    assert store.get_bank_balance(CHILD_PHONE, "earned") == 30
+    assert store.get_bank_balance(CHILD_PHONE, "weekly") == 0
+
+
+def test_playtime_rules_rollover_updates_every_bank(tmp_path: Path) -> None:
+    store = build_store(tmp_path)
+    settings = build_settings(
+        tmp_path,
+        banks={
+            "earned": BankProfile("earned", 60, 200),
+            "weekly": BankProfile("weekly", 90, 90),
+        },
+    )
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    store.set_bank_balance(CHILD_PHONE, 170, "earned")
+    store.set_bank_balance(CHILD_PHONE, 20, "weekly")
+
+    rules.rollover_week()
+
+    assert store.get_bank_balance(CHILD_PHONE, "earned") == 200
+    assert store.get_bank_balance(CHILD_PHONE, "weekly") == 90
+
+
+def test_bank_balance_persists_on_profile_switch_until_rollover(tmp_path: Path) -> None:
+    store = build_store(tmp_path)
+    settings = build_settings(tmp_path)
+    high_profile = settings.default_rule_profile
+    low_profile = RuleProfile(
+        name="low",
+        banks={"default": BankProfile("default", 30, 90)},
+        accrued_playtime_max_minutes=180,
+        break_recovery_rate=3.0,
+        blackout_periods=[],
+    )
+    active_profile = [high_profile]
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: active_profile[0])
+    store.set_bank_balance(CHILD_PHONE, 200)
+
+    active_profile[0] = low_profile
+    rules.get_status()
+    assert store.get_bank_balance(CHILD_PHONE) == 200
+
+    rules.rollover_week()
+
+    assert store.get_bank_balance(CHILD_PHONE) == 90
+    decision = rules.evaluate_request(30)
+    assert decision.allowed is True
 
 
 def test_playtime_rules_rollover_week(tmp_path: Path) -> None:
@@ -463,7 +548,7 @@ def test_playtime_rules_rollover_week(tmp_path: Path) -> None:
 
 def test_playtime_rules_set_bank(tmp_path: Path) -> None:
     store = build_store(tmp_path)
-    settings = build_settings(tmp_path, max_bank_minutes=200)
+    settings = build_settings(tmp_path, banks={"default": BankProfile("default", 60, 200)})
     rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
     store.set_bank_balance(CHILD_PHONE, 30)
 

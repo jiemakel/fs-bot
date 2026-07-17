@@ -4,7 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from family_safety_bot.config import Child, RuleProfile, Settings
+from family_safety_bot.config import BankProfile, Child, RuleProfile, Settings
 from family_safety_bot.storage import PlaytimeStore
 
 CHILD_PHONE = "+1234567890"
@@ -23,9 +23,7 @@ def build_store(tmp_path: Path) -> PlaytimeStore:
 def build_settings(tmp_path: Path, **overrides: Any) -> Settings:
     default_profile = RuleProfile(
         name="default",
-        weekly_addition_minutes=840,
-        weekly_max_minutes=1800,
-        max_bank_minutes=2520,
+        banks={"default": BankProfile("default", 840, 2520)},
         accrued_playtime_max_minutes=180,
         break_recovery_rate=3.0,
         blackout_periods=[],
@@ -43,9 +41,7 @@ def build_settings(tmp_path: Path, **overrides: Any) -> Settings:
     profile_updates = {
         key: overrides.pop(key)
         for key in (
-            "weekly_addition_minutes",
-            "weekly_max_minutes",
-            "max_bank_minutes",
+            "banks",
             "accrued_playtime_max_minutes",
             "break_recovery_rate",
             "blackout_periods",
