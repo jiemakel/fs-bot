@@ -24,6 +24,7 @@ def build_settings(tmp_path: Path, **overrides: Any) -> Settings:
     default_profile = RuleProfile(
         name="default",
         weekly_addition_minutes=840,
+        weekly_max_minutes=1800,
         max_bank_minutes=2520,
         accrued_playtime_max_minutes=180,
         break_recovery_rate=3.0,
@@ -43,6 +44,7 @@ def build_settings(tmp_path: Path, **overrides: Any) -> Settings:
         key: overrides.pop(key)
         for key in (
             "weekly_addition_minutes",
+            "weekly_max_minutes",
             "max_bank_minutes",
             "accrued_playtime_max_minutes",
             "break_recovery_rate",

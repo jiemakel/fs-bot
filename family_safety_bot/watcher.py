@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import shlex
+import sqlite3
 from datetime import datetime, timezone, timedelta
 from typing import Awaitable, Callable
 
@@ -211,6 +212,7 @@ class PlaytimeManager(Command):
             "watcher.profile_summary",
             name=profile.name,
             weekly_addition=format_duration(profile.weekly_addition_minutes),
+            weekly_max=format_duration(profile.weekly_max_minutes),
             max_bank=format_duration(profile.max_bank_minutes),
             accrued_max=format_duration(profile.accrued_playtime_max_minutes),
             break_recovery_rate=f"{profile.break_recovery_rate:.2f}",
@@ -249,6 +251,11 @@ class PlaytimeManager(Command):
                 return minutes
             raise ValueError
 
+        def get_optional_duration(key: str, default: str) -> int:
+            if (minutes := parse_duration_minutes(assignments.get(key, default))) and minutes > 0:
+                return minutes
+            raise ValueError
+
         blackout_periods = [
             period
             for suffix in WEEKDAY_SUFFIXES
@@ -270,6 +277,7 @@ class PlaytimeManager(Command):
         return RuleProfile(
             name=profile_name,
             weekly_addition_minutes=get_duration("WEEKLY_ADDITION_TIME"),
+            weekly_max_minutes=get_optional_duration("WEEKLY_MAX_TIME", "30h"),
             max_bank_minutes=get_duration("MAX_BANK_TIME"),
             accrued_playtime_max_minutes=get_duration("ACCRUED_PLAYTIME_MAX_TIME"),
             break_recovery_rate=break_recovery_rate,
@@ -356,7 +364,12 @@ class PlaytimeManager(Command):
         except ValueError:
             await ctx.send(self._i18n.msg("watcher.profile_invalid"))
             return
-        self._store.upsert_rule_profile(created)
+        try:
+            self._store.upsert_rule_profile(created)
+        except sqlite3.Error:
+            logger.exception("Failed to save rule profile %s", name)
+            await ctx.send(self._i18n.msg("watcher.profile_save_failed", profile_name=name))
+            return
         self._profiles_by_name[name.lower()] = created
         await ctx.send(
             self._i18n.msg("watcher.profile_defined", profile_name=name)

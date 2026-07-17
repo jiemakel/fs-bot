@@ -123,6 +123,42 @@ def test_playtime_rules_exceeds_bank_balance(tmp_path: Path) -> None:
     assert decision.minutes_granted == 30
 
 
+def test_playtime_rules_weekly_allowance_caps_grants(tmp_path: Path) -> None:
+    store = build_store(tmp_path)
+    settings = build_settings(tmp_path, weekly_max_minutes=90, accrued_playtime_max_minutes=300)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    now = datetime(2025, 1, 8, 12, 0, tzinfo=timezone.utc)
+    rules._get_local_now = lambda: now  # type: ignore[method-assign]
+    store.set_bank_balance(CHILD_PHONE, 300)
+    store.add_session(CHILD_PHONE, now - timedelta(days=1), 60)
+    active = store.get_active_session(CHILD_PHONE)
+    assert active is not None
+    store.complete_session(active[0], now - timedelta(days=1, minutes=-60))
+
+    decision = rules.evaluate_request(60)
+
+    assert decision.allowed is True
+    assert decision.minutes_granted == 30
+    assert "weekly allowance" in decision.reason
+
+
+def test_playtime_rules_weekly_allowance_releases_unused_active_time(tmp_path: Path) -> None:
+    store = build_store(tmp_path)
+    settings = build_settings(tmp_path, weekly_max_minutes=90, accrued_playtime_max_minutes=300)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    start = datetime(2025, 1, 8, 12, 0, tzinfo=timezone.utc)
+    rules._get_local_now = lambda: start  # type: ignore[method-assign]
+    store.set_bank_balance(CHILD_PHONE, 300)
+
+    decision = rules.evaluate_request(90)
+    rules.grant_playtime(decision.minutes_granted)
+    assert rules.evaluate_request(120).allowed is False
+
+    rules._get_local_now = lambda: start + timedelta(minutes=30)  # type: ignore[method-assign]
+    rules.complete_session()
+    assert rules.evaluate_request(60).minutes_granted == 60
+
+
 def test_playtime_rules_accrued_playtime_maxed(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path)
@@ -379,6 +415,26 @@ def test_playtime_rules_status_active_recovery_calculates_without_persisting(tmp
     balance, _, _rest = store.get_accrued_playtime(CHILD_PHONE)
     assert "30m/3h" in status
     assert balance == 0
+
+
+def test_playtime_rules_status_pace_uses_weekly_cap_not_bank(tmp_path: Path) -> None:
+    store = build_store(tmp_path)
+    settings = build_settings(
+        tmp_path,
+        weekly_max_minutes=100,
+        accrued_playtime_max_minutes=300,
+    )
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    now = datetime(2025, 1, 8, 12, 0, tzinfo=timezone.utc)
+    rules._get_local_now = lambda: now  # type: ignore[method-assign]
+    store.set_bank_balance(CHILD_PHONE, 1000)
+    session_id = store.add_session(CHILD_PHONE, now - timedelta(days=1), 40)
+    store.complete_session(session_id, now - timedelta(days=1) + timedelta(minutes=40))
+
+    status = rules.get_status()
+
+    assert "allowance left 60.0%" in status
+    assert "Bank:" not in status
 
 
 def test_playtime_rules_add_to_bank(tmp_path: Path) -> None:

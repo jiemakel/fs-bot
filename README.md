@@ -63,10 +63,11 @@ DATA_DIR=./data
 BOT_LANGUAGE=en
 ```
 
-Optional rule settings in `.env` control the weekly allowance, max bank, continuous-play cap, recovery rate, and blackout windows:
+Optional rule settings in `.env` control the weekly bank addition, weekly spending allowance, max bank, continuous-play cap, recovery rate, and blackout windows:
 
 ```env
 WEEKLY_ADDITION_TIME=14h
+WEEKLY_MAX_TIME=30h
 MAX_BANK_TIME=42h
 ACCRUED_PLAYTIME_MAX_TIME=3h
 BREAK_RECOVERY_RATE=3.0

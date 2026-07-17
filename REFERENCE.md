@@ -35,6 +35,7 @@ Child names are case-insensitive for commands and must be unique after lowercasi
 ### Rule Settings
 
 - `WEEKLY_ADDITION_TIME` - Playtime added during weekly rollover. Default: `14h`.
+- `WEEKLY_MAX_TIME` - Maximum playtime that can be used or committed in one Monday-to-Sunday week. Default: `30h`.
 - `MAX_BANK_TIME` - Maximum banked playtime. Default: `42h`.
 - `ACCRUED_PLAYTIME_MAX_TIME` - Continuous/accrued playtime cap before a break is required. Default: `3h`.
 - `BREAK_RECOVERY_RATE` - Break recovery multiplier. Default: `3.0`, meaning 1 minute of break recovers 3 minutes of accrued playtime.
@@ -121,6 +122,7 @@ Format each value as comma-separated `HH:MM-HH:MM` ranges. `24:00` is accepted a
 - `BLACKOUT_PERIOD_SUN`
 
 Use an empty value for a day with no blackout periods, for example `BLACKOUT_PERIOD_SAT=`.
+`WEEKLY_MAX_TIME` is optional in profile definitions and defaults to `30h` when omitted.
 
 ---
 
@@ -129,7 +131,9 @@ Use an empty value for a day with no blackout periods, for example `BLACKOUT_PER
 - Local state is updated only after a successful Microsoft Family Safety grant.
 - If Microsoft grant/authentication fails, the request is rejected and local state is unchanged.
 - Ending a session first applies an immediate Microsoft block; if that block fails, the session is not ended locally.
-- Partial grants give the maximum currently allowed time when bank, accrued-playtime, or blackout limits prevent the full request.
+- Partial grants give the maximum currently allowed time when bank, weekly allowance, accrued-playtime, or blackout limits prevent the full request.
+- Activity rewards can grow the bank up to its maximum, but do not increase the weekly spending allowance.
+- Weekly usage includes completed playtime and time committed to an active session; ending early releases the unused portion.
 - Activity claims remain pending until an admin runs `ack` or an explicit bank modification.
 - Accrued playtime recovery is granted only when the full required break has completed.
 - If a child briefly interrupts recovery, stopping within the grace window preserves the previous recovery progress.
@@ -147,7 +151,7 @@ Use an empty value for a day with no blackout periods, for example `BLACKOUT_PER
 
 Under `DATA_DIR`:
 
-- `playtime.sqlite3` - Bank balances, sessions, claims, profiles, active profile assignments, recovery state, and weekly baselines.
+- `playtime.sqlite3` - Bank balances, sessions, claims, profiles, active profile assignments, and recovery state.
 - `signalbot.sqlite3` - SignalBot framework state.
 
 The linked Signal account state belongs to `signal-cli-rest-api`; in the provided Docker Compose file it is stored in the `signal-cli-data` Docker volume.

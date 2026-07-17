@@ -25,6 +25,7 @@ class RuleProfile:
 
     name: str
     weekly_addition_minutes: int
+    weekly_max_minutes: int
     max_bank_minutes: int
     accrued_playtime_max_minutes: int
     break_recovery_rate: float
@@ -158,9 +159,10 @@ class Settings:
             default_rule_profile=RuleProfile(
                 name=normalize_profile_name(env.get("RULE_PROFILE_DEFAULT_NAME", "default")),
                 weekly_addition_minutes=Settings._parse_duration_minutes(env.get("WEEKLY_ADDITION_TIME", "14h"), "WEEKLY_ADDITION_TIME"),
+                weekly_max_minutes=Settings._parse_duration_minutes(env.get("WEEKLY_MAX_TIME", "30h"), "WEEKLY_MAX_TIME"),
                 max_bank_minutes=Settings._parse_duration_minutes(env.get("MAX_BANK_TIME", "42h"), "MAX_BANK_TIME"),
                 # This also caps a single playtime request.
-                accrued_playtime_max_minutes=Settings._parse_duration_minutes(env.get("ACCRUED_PLAYTIME_MAX_TIME", env.get("BREAK_BALANCE_MAX_TIME", "3h")), "ACCRUED_PLAYTIME_MAX_TIME"),
+                accrued_playtime_max_minutes=Settings._parse_duration_minutes(env.get("ACCRUED_PLAYTIME_MAX_TIME", "3h"), "ACCRUED_PLAYTIME_MAX_TIME"),
                 break_recovery_rate=float(env.get("BREAK_RECOVERY_RATE", "3.0")),
                 blackout_periods=Settings._parse_blackout_periods_from_env(),
             ),

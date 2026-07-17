@@ -7,13 +7,12 @@ from family_safety_bot.config import Settings, WEEKDAY_SUFFIXES
 _OPTIONAL_SETTINGS_ENV_KEYS = (
     "BOT_LANGUAGE",
     "WEEKLY_ADDITION_TIME",
+    "WEEKLY_MAX_TIME",
     "MAX_BANK_TIME",
     "ACCRUED_PLAYTIME_MAX_TIME",
-    "BREAK_BALANCE_MAX_TIME",
     "BREAK_RECOVERY_RATE",
     "RULE_PROFILE_DEFAULT_NAME",
     "TZ",
-    "TIMEZONE",
     "DATA_DIR",
     *[f"BLACKOUT_PERIOD_{suffix}" for suffix in WEEKDAY_SUFFIXES],
     *[f"ADMIN_{index}_PHONE" for index in range(1, 12)],
@@ -43,6 +42,7 @@ def _set_minimal_env(monkeypatch) -> None:
 
 def test_settings_time_accepts_h_m_and_h_plus_m(monkeypatch) -> None:
     monkeypatch.setenv("WEEKLY_ADDITION_TIME", "1h+30m")
+    monkeypatch.setenv("WEEKLY_MAX_TIME", "30h")
     monkeypatch.setenv("MAX_BANK_TIME", "150m")
     monkeypatch.setenv("ACCRUED_PLAYTIME_MAX_TIME", "2h")
     _set_minimal_env(monkeypatch)
@@ -50,6 +50,7 @@ def test_settings_time_accepts_h_m_and_h_plus_m(monkeypatch) -> None:
     settings = Settings.from_env()
 
     assert settings.default_rule_profile.weekly_addition_minutes == 90
+    assert settings.default_rule_profile.weekly_max_minutes == 1800
     assert settings.default_rule_profile.max_bank_minutes == 150
     assert settings.default_rule_profile.accrued_playtime_max_minutes == 120
 
@@ -63,6 +64,14 @@ def test_settings_time_accepts_compact_combined_notation(monkeypatch) -> None:
     settings = Settings.from_env()
 
     assert settings.default_rule_profile.weekly_addition_minutes == 90
+
+
+def test_settings_weekly_max_defaults_to_30_hours(monkeypatch) -> None:
+    _set_minimal_env(monkeypatch)
+
+    settings = Settings.from_env()
+
+    assert settings.default_rule_profile.weekly_max_minutes == 1800
 
 
 def test_settings_parses_bot_language(monkeypatch) -> None:
@@ -102,22 +111,3 @@ def test_settings_parses_day_specific_blackout_periods_including_24_00(monkeypat
         (0, "20:30", "24:00"),
         (2, "14:15", "15:45"),
     ]
-
-
-def test_settings_ignores_timezone_env_alias_and_uses_tz(monkeypatch) -> None:
-    _set_minimal_env(monkeypatch)
-    monkeypatch.setenv("TIMEZONE", "America/New_York")
-    monkeypatch.setenv("TZ", "Europe/Paris")
-
-    settings = Settings.from_env()
-
-    assert settings.timezone == "Europe/Paris"
-
-
-def test_settings_defaults_timezone_when_only_timezone_alias_is_set(monkeypatch) -> None:
-    _set_minimal_env(monkeypatch)
-    monkeypatch.setenv("TIMEZONE", "America/New_York")
-
-    settings = Settings.from_env()
-
-    assert settings.timezone == "Europe/Helsinki"

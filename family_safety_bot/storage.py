@@ -4,7 +4,7 @@ import json
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TypeAlias
 
 from family_safety_bot.config import RuleProfile
@@ -63,6 +63,7 @@ class PlaytimeStore:
             CREATE TABLE IF NOT EXISTS rule_profiles (
                 profile_name TEXT PRIMARY KEY,
                 weekly_addition_minutes INTEGER NOT NULL,
+                weekly_max_minutes INTEGER NOT NULL DEFAULT 1800,
                 max_bank_minutes INTEGER NOT NULL,
                 accrued_playtime_max_minutes INTEGER NOT NULL,
                 break_recovery_rate REAL NOT NULL,
@@ -71,12 +72,6 @@ class PlaytimeStore:
             CREATE TABLE IF NOT EXISTS app_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS weekly_bank_baselines (
-                child_id TEXT NOT NULL,
-                week_start_iso TEXT NOT NULL,
-                baseline_minutes INTEGER NOT NULL,
-                PRIMARY KEY (child_id, week_start_iso)
             );
             CREATE TABLE IF NOT EXISTS activity_claims (
                 claim_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,44 +84,7 @@ class PlaytimeStore:
             );
             """
         )
-        cls._migrate_accrued_playtime_schema(conn)
-        cls._migrate_rule_profile_schema(conn)
         conn.commit()
-
-    @staticmethod
-    def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
-        return conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?;",
-            (table_name,),
-        ).fetchone() is not None
-
-    @staticmethod
-    def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
-        return {row[1] for row in conn.execute(f"PRAGMA table_info({table_name});").fetchall()}
-
-    @classmethod
-    def _migrate_accrued_playtime_schema(cls, conn: sqlite3.Connection) -> None:
-        if not cls._table_exists(conn, "break_balance"):
-            return
-        if "rest_accumulated_minutes" not in cls._table_columns(conn, "break_balance"):
-            conn.execute("ALTER TABLE break_balance ADD COLUMN rest_accumulated_minutes REAL NOT NULL DEFAULT 0.0")
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO accrued_playtime (
-                child_id, playtime_minutes, last_update_iso, rest_accumulated_minutes
-            )
-            SELECT child_id, balance_minutes, last_update_iso, rest_accumulated_minutes
-            FROM break_balance;
-            """
-        )
-
-    @classmethod
-    def _migrate_rule_profile_schema(cls, conn: sqlite3.Connection) -> None:
-        columns = cls._table_columns(conn, "rule_profiles")
-        if "accrued_playtime_max_minutes" in columns or "break_balance_max_minutes" not in columns:
-            return
-        conn.execute("ALTER TABLE rule_profiles ADD COLUMN accrued_playtime_max_minutes INTEGER NOT NULL DEFAULT 0")
-        conn.execute("UPDATE rule_profiles SET accrued_playtime_max_minutes = break_balance_max_minutes")
 
     def _execute(
         self,
@@ -165,10 +123,11 @@ class PlaytimeStore:
         return RuleProfile(
             name=row[0],
             weekly_addition_minutes=row[1],
-            max_bank_minutes=row[2],
-            accrued_playtime_max_minutes=row[3],
-            break_recovery_rate=row[4],
-            blackout_periods=cls._deserialize_blackout_periods(row[5]),
+            weekly_max_minutes=row[2],
+            max_bank_minutes=row[3],
+            accrued_playtime_max_minutes=row[4],
+            break_recovery_rate=row[5],
+            blackout_periods=cls._deserialize_blackout_periods(row[6]),
         )
 
     def _set_app_state(self, key: str, value: str) -> None:
@@ -231,48 +190,6 @@ class PlaytimeStore:
         actual_added = new_balance - current
         self.set_bank_balance(child_id, new_balance)
         return actual_added
-
-    def get_weekly_bank_baseline(self, child_id: str, week_start_iso: str, fallback_minutes: int) -> int:
-        """Get baseline minutes for the given child/week, initializing from fallback if missing."""
-        row = self._execute(
-            """
-            SELECT baseline_minutes
-            FROM weekly_bank_baselines
-            WHERE child_id = ? AND week_start_iso = ?;
-            """,
-            (child_id, week_start_iso),
-        ).fetchone()
-        if row is not None:
-            return row[0]
-
-        self._execute(
-            """
-            INSERT INTO weekly_bank_baselines (child_id, week_start_iso, baseline_minutes)
-            VALUES (?, ?, ?);
-            """,
-            (child_id, week_start_iso, fallback_minutes),
-            commit=True,
-        )
-        return fallback_minutes
-
-    def set_weekly_bank_baseline(self, child_id: str, week_start_iso: str, baseline_minutes: int) -> None:
-        self._execute(
-            """
-            INSERT INTO weekly_bank_baselines (child_id, week_start_iso, baseline_minutes)
-            VALUES (?, ?, ?)
-            ON CONFLICT(child_id, week_start_iso) DO UPDATE SET
-                baseline_minutes = excluded.baseline_minutes;
-            """,
-            (child_id, week_start_iso, max(0, baseline_minutes)),
-            commit=True,
-        )
-
-    def add_to_weekly_bank_baseline(self, child_id: str, week_start_iso: str, delta_minutes: int, fallback_minutes: int) -> int:
-        """Increase baseline for the given week and return the new baseline."""
-        baseline = self.get_weekly_bank_baseline(child_id, week_start_iso, fallback_minutes)
-        new_baseline = max(0, baseline + delta_minutes)
-        self.set_weekly_bank_baseline(child_id, week_start_iso, new_baseline)
-        return new_baseline
 
     def get_accrued_playtime(self, child_id: str) -> tuple[int, datetime, float]:
         """Get (accrued_playtime_minutes, last_update_time, rest_accumulated_minutes) for a child."""
@@ -353,20 +270,49 @@ class PlaytimeStore:
 
         return (row[0], datetime.fromisoformat(row[1]), row[2])
 
+    def get_playtime_minutes_in_window(
+        self,
+        child_id: str,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> int:
+        """Return used or committed session minutes overlapping a time window."""
+        rows = self._execute(
+            """
+            SELECT start_time_iso, end_time_iso, minutes_granted, completed
+            FROM sessions
+            WHERE child_id = ?;
+            """,
+            (child_id,),
+            child_id=child_id,
+        ).fetchall()
+        total = 0
+        for start_iso, end_iso, minutes_granted, completed in rows:
+            start = _parse_stored_datetime(start_iso)
+            scheduled_end = start + timedelta(minutes=minutes_granted)
+            end = _parse_stored_datetime(end_iso) if completed and end_iso else scheduled_end
+            overlap_start = max(start, window_start)
+            overlap_end = min(end, scheduled_end, window_end)
+            if overlap_end > overlap_start:
+                total += int((overlap_end - overlap_start).total_seconds() / 60)
+        return total
+
     def upsert_rule_profile(self, profile: RuleProfile) -> None:
         self._execute(
             """
             INSERT INTO rule_profiles (
                 profile_name,
                 weekly_addition_minutes,
+                weekly_max_minutes,
                 max_bank_minutes,
                 accrued_playtime_max_minutes,
                 break_recovery_rate,
                 blackout_periods_json
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(profile_name) DO UPDATE SET
                 weekly_addition_minutes = excluded.weekly_addition_minutes,
+                weekly_max_minutes = excluded.weekly_max_minutes,
                 max_bank_minutes = excluded.max_bank_minutes,
                 accrued_playtime_max_minutes = excluded.accrued_playtime_max_minutes,
                 break_recovery_rate = excluded.break_recovery_rate,
@@ -375,6 +321,7 @@ class PlaytimeStore:
             (
                 profile.name,
                 profile.weekly_addition_minutes,
+                profile.weekly_max_minutes,
                 profile.max_bank_minutes,
                 profile.accrued_playtime_max_minutes,
                 profile.break_recovery_rate,
@@ -389,6 +336,7 @@ class PlaytimeStore:
             SELECT
                 profile_name,
                 weekly_addition_minutes,
+                weekly_max_minutes,
                 max_bank_minutes,
                 accrued_playtime_max_minutes,
                 break_recovery_rate,

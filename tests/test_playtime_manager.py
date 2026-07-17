@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 import asyncio
+import sqlite3
 
 import pytest
 from signalbot import Context, SignalBot
@@ -427,6 +428,31 @@ def test_playtime_manager_child_profile_switch_affects_limits(tmp_path: Path) ->
 
     assert len(ctx.sent_messages) == 1
     assert store.get_bank_balance(CHILD_PHONE) == 60
+
+
+def test_playtime_manager_profile_database_error_is_reported(tmp_path: Path, monkeypatch) -> None:
+    manager, store = _build_manager(tmp_path)
+    env_payload = (
+        "WEEKLY_ADDITION_TIME=14h MAX_BANK_TIME=1h ACCRUED_PLAYTIME_MAX_TIME=3h BREAK_RECOVERY_RATE=3.0 "
+        "BLACKOUT_PERIOD_MON= BLACKOUT_PERIOD_TUE= BLACKOUT_PERIOD_WED= "
+        "BLACKOUT_PERIOD_THU= BLACKOUT_PERIOD_FRI= BLACKOUT_PERIOD_SAT= BLACKOUT_PERIOD_SUN="
+    )
+    monkeypatch.setattr(
+        store,
+        "upsert_rule_profile",
+        lambda _profile: (_ for _ in ()).throw(sqlite3.IntegrityError("test error")),
+    )
+    ctx = FakeContext(
+        message_text=f"profile define strict {env_payload}",
+        sender=ADMIN_PHONE,
+        sent_messages=[],
+    )
+
+    _run_handle(manager, ctx)
+
+    assert len(ctx.sent_messages) == 1
+    assert "database error" in ctx.sent_messages[0]
+    assert "strict" not in manager._profiles_by_name
 
 
 
