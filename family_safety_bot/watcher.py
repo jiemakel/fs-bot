@@ -156,7 +156,10 @@ class PlaytimeManager(Command):
         parts = stripped.split(maxsplit=1)
         if len(parts) == 2:
             child_name, duration_text = parts
-            if (minutes := parse_minutes(duration_text)) is not None:
+            if child_name == "*":
+                if (minutes := parse_minutes(duration_text)) is not None:
+                    return (self._all_children(), minutes, not duration_text.lstrip().startswith("="))
+            elif (minutes := parse_minutes(duration_text)) is not None:
                 if resolved := await self._resolve_child(ctx, child_name):
                     return ([(resolved[0], resolved[1])], minutes, not duration_text.lstrip().startswith("="))
 
@@ -171,7 +174,7 @@ class PlaytimeManager(Command):
         payload: str,
     ) -> list[tuple[Child, PlaytimeRules]] | None:
         child_name = payload.strip()
-        if not child_name:
+        if not child_name or child_name == "*":
             return self._all_children()
         resolved = await self._resolve_child(ctx, child_name)
         if not resolved:
@@ -264,13 +267,19 @@ class PlaytimeManager(Command):
         if profile is None:
             await ctx.send(self._i18n.msg("watcher.profile_unknown", profile_name=parts[1]))
             return
-        resolved = await self._resolve_child(ctx, parts[2])
-        if not resolved:
-            return
-        child, _ = resolved
-        self._active_profile_name_by_child[child.phone_number] = profile.name
-        self._store.set_active_rule_profile_name_for_child(child.phone_number, profile.name)
-        await ctx.send(self._i18n.msg("watcher.profile_switched", child_name=child.name, profile_name=profile.name))
+        if parts[2] == "*":
+            for phone, child in self._settings.children.items():
+                self._active_profile_name_by_child[phone] = profile.name
+                self._store.set_active_rule_profile_name_for_child(phone, profile.name)
+                await ctx.send(self._i18n.msg("watcher.profile_switched", child_name=child.name, profile_name=profile.name))
+        else:
+            resolved = await self._resolve_child(ctx, parts[2])
+            if not resolved:
+                return
+            child, _ = resolved
+            self._active_profile_name_by_child[child.phone_number] = profile.name
+            self._store.set_active_rule_profile_name_for_child(child.phone_number, profile.name)
+            await ctx.send(self._i18n.msg("watcher.profile_switched", child_name=child.name, profile_name=profile.name))
 
     async def _do_profile_define(self, ctx: Context, payload: str) -> None:
         parts = payload.split(maxsplit=2)
@@ -436,13 +445,22 @@ class PlaytimeManager(Command):
             if not self._has_profile(child.phone_number):
                 await self._send_admin_result(ctx, child, self._i18n.msg("watcher.profile_not_assigned"))
                 continue
-            pending_note = self._auto_handle_pending_claims(child) if bank_name is None else ""
-            result = (
-                rules.modify_bank(minutes, bank_name)
-                if is_relative
-                else rules.set_bank(minutes, bank_name)
-            )
-            await self._send_admin_result(ctx, child, result + pending_note)
+            if bank_name == "*":
+                pending_note = self._auto_handle_pending_claims(child)
+                profile = self._profile_for_child(child.phone_number)
+                results = [
+                    rules.modify_bank(minutes, bkey) if is_relative else rules.set_bank(minutes, bkey)
+                    for bkey in profile.banks
+                ]
+                await self._send_admin_result(ctx, child, "\n".join(results) + pending_note)
+            else:
+                pending_note = self._auto_handle_pending_claims(child) if bank_name is None else ""
+                result = (
+                    rules.modify_bank(minutes, bank_name)
+                    if is_relative
+                    else rules.set_bank(minutes, bank_name)
+                )
+                await self._send_admin_result(ctx, child, result + pending_note)
         return True
 
     def _parse_admin_bank_payload(
@@ -457,14 +475,21 @@ class PlaytimeManager(Command):
             minutes = parse_signed_duration_minutes(text)
             return None if minutes is None else (minutes, not text.lstrip().startswith("="))
 
-        if len(parts) >= 3 and (child_rules := self._children_by_name.get(parts[0].lower())):
-            if parsed := parsed_duration(" ".join(parts[2:])):
-                child, rules = child_rules
-                return ([(child, rules)], parts[1], parsed[0], parsed[1])
-        if len(parts) >= 2 and (child_rules := self._children_by_name.get(parts[0].lower())):
-            if parsed := parsed_duration(" ".join(parts[1:])):
-                child, rules = child_rules
-                return ([(child, rules)], None, parsed[0], parsed[1])
+        first_is_all_children = parts[0] == "*"
+        child_rules_entry = None if first_is_all_children else self._children_by_name.get(parts[0].lower())
+        first_is_child = first_is_all_children or (child_rules_entry is not None)
+
+        if first_is_child:
+            children: list[tuple[Child, PlaytimeRules]] = (
+                self._all_children() if first_is_all_children else [(child_rules_entry[0], child_rules_entry[1])]  # type: ignore[index]
+            )
+            if len(parts) >= 3 and (parsed := parsed_duration(" ".join(parts[2:]))):
+                bank_name: str | None = "*" if parts[1] == "*" else parts[1]
+                return (children, bank_name, parsed[0], parsed[1])
+            if len(parts) >= 2 and (parsed := parsed_duration(" ".join(parts[1:]))):
+                return (children, None, parsed[0], parsed[1])
+            return None
+
         if len(parts) >= 2 and (parsed := parsed_duration(" ".join(parts[1:]))):
             return (self._all_children(), parts[0], parsed[0], parsed[1])
         if parsed := parsed_duration(payload):

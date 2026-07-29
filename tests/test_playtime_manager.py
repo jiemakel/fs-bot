@@ -571,3 +571,132 @@ def test_admin_bank_modification_auto_handles_pending_claims(tmp_path: Path) -> 
     assert len(ctx.sent_messages) == 1
     assert store.get_bank_balance(CHILD_PHONE) == 120  # 60 + 60
     assert store.get_pending_claims(CHILD_PHONE) == []
+
+
+# ---------------------------------------------------------------------------
+# Wildcard (*) placeholder tests
+# ---------------------------------------------------------------------------
+
+SECOND_PHONE = "+1234567892"
+
+
+def _build_two_child_manager(tmp_path: Path, **settings_overrides: Any) -> tuple[PlaytimeManager, PlaytimeStore]:
+    children = {
+        CHILD_PHONE: Child(CHILD_PHONE, "child123", "TestChild"),
+        SECOND_PHONE: Child(SECOND_PHONE, "child456", "SecondChild"),
+    }
+    return _build_manager(tmp_path, children=children, **settings_overrides)
+
+
+def test_admin_wildcard_child_block_targets_all(tmp_path: Path) -> None:
+    manager, store = _build_two_child_manager(tmp_path)
+
+    ctx = FakeContext(message_text="block *", sender=ADMIN_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert store.is_child_block_mode_enabled(CHILD_PHONE) is True
+    assert store.is_child_block_mode_enabled(SECOND_PHONE) is True
+    assert len(ctx.sent_messages) == 2
+
+
+def test_admin_wildcard_child_unblock_targets_all(tmp_path: Path) -> None:
+    manager, store = _build_two_child_manager(tmp_path)
+    store.set_child_block_mode(CHILD_PHONE, True)
+    store.set_child_block_mode(SECOND_PHONE, True)
+
+    ctx = FakeContext(message_text="unblock *", sender=ADMIN_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert store.is_child_block_mode_enabled(CHILD_PHONE) is False
+    assert store.is_child_block_mode_enabled(SECOND_PHONE) is False
+    assert len(ctx.sent_messages) == 2
+
+
+def test_admin_wildcard_child_bank_command_targets_all_children(tmp_path: Path) -> None:
+    manager, store = _build_two_child_manager(tmp_path)
+    store.set_bank_balance(CHILD_PHONE, 60)
+    store.set_bank_balance(SECOND_PHONE, 30)
+
+    ctx = FakeContext(message_text="* +1h", sender=ADMIN_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert store.get_bank_balance(CHILD_PHONE) == 120
+    assert store.get_bank_balance(SECOND_PHONE) == 90
+    assert len(ctx.sent_messages) == 2
+
+
+def test_admin_wildcard_bank_modifies_all_profile_banks_for_named_child(tmp_path: Path) -> None:
+    manager, store = _build_manager(
+        tmp_path,
+        banks={
+            "earned": BankProfile("earned", 60, 300),
+            "weekly": BankProfile("weekly", 90, 90),
+        },
+    )
+    store.set_bank_balance(CHILD_PHONE, 30, "earned")
+    store.set_bank_balance(CHILD_PHONE, 20, "weekly")
+
+    ctx = FakeContext(message_text="TestChild * +30m", sender=ADMIN_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert store.get_bank_balance(CHILD_PHONE, "earned") == 60
+    assert store.get_bank_balance(CHILD_PHONE, "weekly") == 50
+    assert len(ctx.sent_messages) == 1
+
+
+def test_admin_wildcard_both_modifies_all_profile_banks_for_all_children(tmp_path: Path) -> None:
+    manager, store = _build_two_child_manager(
+        tmp_path,
+        banks={
+            "earned": BankProfile("earned", 60, 300),
+            "weekly": BankProfile("weekly", 90, 90),
+        },
+    )
+    store.set_bank_balance(CHILD_PHONE, 30, "earned")
+    store.set_bank_balance(CHILD_PHONE, 20, "weekly")
+    store.set_bank_balance(SECOND_PHONE, 10, "earned")
+    store.set_bank_balance(SECOND_PHONE, 5, "weekly")
+
+    ctx = FakeContext(message_text="* * +30m", sender=ADMIN_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert store.get_bank_balance(CHILD_PHONE, "earned") == 60
+    assert store.get_bank_balance(CHILD_PHONE, "weekly") == 50
+    assert store.get_bank_balance(SECOND_PHONE, "earned") == 40
+    assert store.get_bank_balance(SECOND_PHONE, "weekly") == 35
+    assert len(ctx.sent_messages) == 2
+
+
+def test_admin_wildcard_bank_only_touches_active_profile_banks(tmp_path: Path) -> None:
+    """* for bank name must not affect banks outside the child's active profile."""
+    manager, store = _build_manager(
+        tmp_path,
+        banks={
+            "earned": BankProfile("earned", 60, 300),
+        },
+    )
+    store.set_bank_balance(CHILD_PHONE, 30, "earned")
+    # Write a balance for a bank not in the active profile to confirm it is untouched.
+    store.set_bank_balance(CHILD_PHONE, 50, "legacy")
+
+    ctx = FakeContext(message_text="TestChild * +30m", sender=ADMIN_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert store.get_bank_balance(CHILD_PHONE, "earned") == 60
+    assert store.get_bank_balance(CHILD_PHONE, "legacy") == 50  # unchanged
+
+
+def test_admin_profile_use_wildcard_assigns_to_all_children(tmp_path: Path) -> None:
+    manager, _store = _build_two_child_manager(tmp_path)
+    profile_json = _profile_json()
+    _run_handle(
+        manager,
+        FakeContext(message_text=f"profile define strict {profile_json}", sender=ADMIN_PHONE, sent_messages=[]),
+    )
+
+    ctx = FakeContext(message_text="profile use strict *", sender=ADMIN_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert manager._profile_for_child(CHILD_PHONE).name == "strict"
+    assert manager._profile_for_child(SECOND_PHONE).name == "strict"
+    assert len(ctx.sent_messages) == 2

@@ -70,7 +70,7 @@
     "rules.no_active_session": "No active session to complete.",
     "rules.session_completed": "✅ Session completed. Played {minutes}.",
     "rules.session_completed_credited": " ({minutes} credited back to bank)",
-    "rules.recovery_interrupted_warning": "⚠️ Recovery interrupted. Stop within 1 minute to preserve the previous break progress.",
+    "rules.recovery_interrupted_warning": "⚠️ Recovery interrupted. Stop within 2 minutes to preserve the previous break progress.",
     "rules.recovery_restored": "✅ Previous recovery progress restored.",
     "rules.recovery_bank_completed": "✅ Recovery bank '{bank_name}' refilled after the completed break.",
     "rules.status_title": "📊 Playtime Status",

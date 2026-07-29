@@ -257,7 +257,7 @@ def test_recovery_break_progress_resets_after_grace_expires(tmp_path: Path) -> N
     rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
     base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
     grant_at = base + timedelta(minutes=20)
-    stop_at = grant_at + timedelta(minutes=2)
+    stop_at = grant_at + timedelta(minutes=2, seconds=1)
     store.set_bank_balance(CHILD_PHONE, 300)
     store.set_bank_balance(CHILD_PHONE, 90, "recovery", base)
 

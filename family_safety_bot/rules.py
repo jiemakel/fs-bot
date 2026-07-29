@@ -12,6 +12,8 @@ from family_safety_bot.formatting import format_duration
 from family_safety_bot.i18n import I18n
 from family_safety_bot.storage import ActiveSession, PlaytimeStore
 
+RECOVERY_RESTORE_GRACE_PERIOD_SECONDS = 120
+
 
 def _parse_blackout_period(
     weekday: int,
@@ -435,7 +437,7 @@ class PlaytimeRules:
         interruption = self._store.get_recovery_interruption(self._child_id)
         if interruption is not None:
             saved_starts, interrupted_at = interruption
-            if 0 <= (now - interrupted_at).total_seconds() <= 60:
+            if 0 <= (now - interrupted_at).total_seconds() <= RECOVERY_RESTORE_GRACE_PERIOD_SECONDS:
                 for bank_name, recovery_started in saved_starts.items():
                     balance = self._store.get_bank_balance(self._child_id, bank_name)
                     self._store.set_bank_balance(self._child_id, balance, bank_name, recovery_started)

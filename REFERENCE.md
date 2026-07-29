@@ -129,7 +129,7 @@ The command accepts whitespace and newlines inside the JSON, so this structure c
 - Bank balances are stored by child and bank name independently of profiles. Switching profiles preserves them even when a balance exceeds the new maximum; a later rollover may clamp the balance to the active profile's maximum.
 - Activity claims remain pending until an admin runs `ack` or an explicit bank modification.
 - Recovery banks refill only when their full required break has completed.
-- If a child interrupts recovery, stopping within the one-minute grace window preserves the previous break progress.
+- If a child interrupts recovery, stopping within the two-minute grace window preserves the previous break progress.
 
 ---
 
