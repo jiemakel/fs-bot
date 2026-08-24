@@ -7,7 +7,7 @@ import json
 import sqlite3
 
 import pytest
-from signalbot import Context, SignalBot
+from signalbot import SendMessage, SignalBot
 
 from family_safety_bot.config import BankProfile, Child
 from family_safety_bot.storage import PlaytimeStore
@@ -22,10 +22,14 @@ class FakeMessage:
     mentions: list[Any] = field(default_factory=list)
     quote: Any = None
 
+    @property
+    def source_number(self) -> str:
+        return self.source
+
 
 @dataclass
 class FakeContext:
-    """Fake signalbot Context for testing."""
+    """Fake signalbot DataMessageContext for testing."""
     message_text: str
     sender: str
     sent_messages: list[str]
@@ -36,8 +40,8 @@ class FakeContext:
     def message(self) -> FakeMessage:
         return FakeMessage(self.message_text, self.sender, self.mentions, self.quote)
 
-    async def send(self, text: str) -> None:
-        self.sent_messages.append(text)
+    async def send(self, message: SendMessage) -> None:
+        self.sent_messages.append(message.text or "")
 
 
 @dataclass
@@ -47,8 +51,12 @@ class FakeBot:
     sent: list[tuple[str, str]]
     scheduler: Any = None
 
-    async def send(self, receiver: str, text: str, **kwargs) -> None:
-        self.sent.append((receiver, text))
+    @property
+    def messages(self) -> "FakeBot":
+        return self
+
+    async def send(self, message: SendMessage, receiver: str) -> None:
+        self.sent.append((receiver, message.text or ""))
 
 
 def _build_manager(tmp_path: Path, **settings_overrides: Any) -> tuple[PlaytimeManager, PlaytimeStore]:
@@ -64,7 +72,7 @@ def _build_manager(tmp_path: Path, **settings_overrides: Any) -> tuple[PlaytimeM
 
 
 def _run_handle(manager: PlaytimeManager, ctx: FakeContext) -> None:
-    asyncio.run(manager.handle(cast(Context, ctx)))
+    asyncio.run(manager.handle_data_message(ctx))  # type: ignore[arg-type]
 
 
 def _profile_json(banks: dict[str, dict[str, str]] | None = None) -> str:
@@ -90,6 +98,18 @@ def test_playtime_manager_status_command(tmp_path: Path) -> None:
     assert len(ctx.sent_messages) == 1
     assert store.get_bank_balance(CHILD_PHONE) == 120
     assert store.get_active_session(CHILD_PHONE) is None
+
+
+def test_playtime_manager_parses_day_bank_admin_amount(tmp_path: Path) -> None:
+    manager, _store = _build_manager(tmp_path)
+
+    parsed = manager._parse_admin_bank_payload("weekdays =3d")
+
+    assert parsed is not None
+    _children, bank_name, amount, is_relative = parsed
+    assert bank_name == "weekdays"
+    assert amount == 3
+    assert is_relative is False
 
 
 def test_playtime_manager_status_sends_one_message_per_child(tmp_path: Path) -> None:
@@ -420,6 +440,101 @@ def test_playtime_manager_child_profile_switch_affects_limits(tmp_path: Path) ->
 
     assert len(ctx.sent_messages) == 1
     assert store.get_bank_balance(CHILD_PHONE) == 60
+
+
+def test_playtime_manager_defines_and_persists_finnish_day_bank_profile(tmp_path: Path) -> None:
+    manager, store = _build_manager(tmp_path, bot_language="fi")
+    definition = {
+        "banks": {
+            "liikunta": {"weekly_addition": "3h", "max_balance": "30h"},
+            "viikottainen": {"weekly_addition": "22h", "max_balance": "30h"},
+            "arkipäivät": {
+                "days": ["mon", "tue", "wed", "thu", "fri"],
+                "weekly_addition": 3,
+                "max_balance": 4,
+            },
+            "viikonloput": {
+                "days": ["sat", "sun"],
+                "weekly_addition": 1,
+                "max_balance": 2,
+            },
+            "palautuminen": {"recovery_rate": 3.0, "max_balance": "3h"},
+            "palautuminen2": {"recovery_rate": 2.0, "max_balance": "6h"},
+        },
+        "blackouts": [
+            {
+                "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                "start": "00:00",
+                "end": "08:00",
+            }
+        ],
+    }
+    payload = json.dumps(definition, ensure_ascii=False)
+    ctx = FakeContext(
+        message_text=f"profiili määritä default {payload}",
+        sender=ADMIN_PHONE,
+        sent_messages=[],
+    )
+
+    _run_handle(manager, ctx)
+
+    assert "Profiili 'default' määritetty" in ctx.sent_messages[0]
+    persisted = next(profile for profile in store.list_rule_profiles() if profile.name == "default")
+    assert persisted.banks["arkipäivät"].days == (0, 1, 2, 3, 4)
+    assert persisted.banks["viikonloput"].days == (5, 6)
+
+
+def test_playtime_manager_profile_error_includes_validation_reason(tmp_path: Path) -> None:
+    manager, _store = _build_manager(tmp_path, bot_language="fi")
+    ctx = FakeContext(
+        message_text='profiili määritä bad {"banks": {}, "blackouts": []}',
+        sender=ADMIN_PHONE,
+        sent_messages=[],
+    )
+
+    _run_handle(manager, ctx)
+
+    assert "Virheellinen profiili:" in ctx.sent_messages[0]
+    assert "at least one bank" in ctx.sent_messages[0]
+
+
+def test_profile_redefinition_can_change_existing_bank_from_time_to_day_bank(tmp_path: Path) -> None:
+    manager, store = _build_manager(tmp_path, bot_language="fi")
+    original = {
+        "banks": {
+            "arkipäivät": {"weekly_addition": "3h", "max_balance": "4h"},
+        },
+        "blackouts": [],
+    }
+    replacement = {
+        "banks": {
+            "arkipäivät": {
+                "days": ["mon", "tue", "wed", "thu", "fri"],
+                "weekly_addition": 3,
+                "max_balance": 4,
+            },
+        },
+        "blackouts": [],
+    }
+    for definition in (original, replacement):
+        ctx = FakeContext(
+            message_text=(
+                "profiili määritä changing "
+                + json.dumps(definition, ensure_ascii=False)
+            ),
+            sender=ADMIN_PHONE,
+            sent_messages=[],
+        )
+        _run_handle(manager, ctx)
+        assert "Virheellinen profiili" not in ctx.sent_messages[0]
+
+    in_memory = manager._profiles_by_name["changing"].banks["arkipäivät"]
+    persisted = next(profile for profile in store.list_rule_profiles() if profile.name == "changing")
+
+    assert in_memory.is_day_bank is True
+    assert in_memory.days == (0, 1, 2, 3, 4)
+    assert persisted.banks["arkipäivät"].is_day_bank is True
+    assert persisted.banks["arkipäivät"].days == (0, 1, 2, 3, 4)
 
 
 def test_playtime_manager_profile_database_error_is_reported(tmp_path: Path, monkeypatch) -> None:

@@ -145,6 +145,79 @@ def test_playtime_rules_secondary_bank_caps_grants(tmp_path: Path) -> None:
     assert "weekly" in decision.reason
 
 
+def test_day_bank_only_applies_on_matching_days_and_taps_once(tmp_path: Path) -> None:
+    store = build_store(tmp_path)
+    settings = build_settings(
+        tmp_path,
+        banks={
+            "time": BankProfile("time", 180, 300),
+            "weekdays": BankProfile("weekdays", 3, 5, days=(0, 1, 2, 3, 4)),
+            "weekends": BankProfile("weekends", 2, 2, days=(5, 6)),
+        },
+    )
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    monday = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
+    rules._get_local_now = lambda: monday  # type: ignore[method-assign]
+    store.set_bank_balance(CHILD_PHONE, 300, "time")
+    store.set_bank_balance(CHILD_PHONE, 2, "weekdays")
+    store.set_bank_balance(CHILD_PHONE, 0, "weekends")
+
+    assert rules.evaluate_request(30).allowed is True
+    rules.grant_playtime(30)
+    assert store.get_bank_balance(CHILD_PHONE, "weekdays") == 1
+    assert store.get_bank_balance(CHILD_PHONE, "weekends") == 0
+
+    rules._get_local_now = lambda: monday + timedelta(minutes=31)  # type: ignore[method-assign]
+    assert rules.evaluate_request(30).allowed is True
+    rules.grant_playtime(30)
+    assert store.get_bank_balance(CHILD_PHONE, "weekdays") == 1
+
+
+def test_empty_matching_day_bank_denies_but_nonmatching_bank_does_not(tmp_path: Path) -> None:
+    store = build_store(tmp_path)
+    settings = build_settings(
+        tmp_path,
+        banks={
+            "time": BankProfile("time", 180, 300),
+            "weekdays": BankProfile("weekdays", 3, 5, days=(0, 1, 2, 3, 4)),
+            "weekends": BankProfile("weekends", 2, 2, days=(5, 6)),
+        },
+    )
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    store.set_bank_balance(CHILD_PHONE, 300, "time")
+    store.set_bank_balance(CHILD_PHONE, 0, "weekdays")
+    store.set_bank_balance(CHILD_PHONE, 1, "weekends")
+
+    rules._get_local_now = lambda: datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)  # type: ignore[method-assign]
+    decision = rules.evaluate_request(30)
+    assert decision.allowed is False
+    assert "weekdays" in decision.reason
+
+    rules._get_local_now = lambda: datetime(2025, 1, 11, 12, 0, tzinfo=timezone.utc)  # type: ignore[method-assign]
+    assert rules.evaluate_request(30).allowed is True
+
+
+def test_day_banks_cap_grants_at_local_midnight(tmp_path: Path) -> None:
+    store = build_store(tmp_path)
+    settings = build_settings(
+        tmp_path,
+        banks={
+            "time": BankProfile("time", 180, 300),
+            "weekdays": BankProfile("weekdays", 3, 5, days=(0, 1, 2, 3, 4)),
+        },
+    )
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules._get_local_now = lambda: datetime(2025, 1, 6, 23, 30, tzinfo=timezone.utc)  # type: ignore[method-assign]
+    store.set_bank_balance(CHILD_PHONE, 300, "time")
+    store.set_bank_balance(CHILD_PHONE, 2, "weekdays")
+
+    decision = rules.evaluate_request(60)
+
+    assert decision.allowed is True
+    assert decision.minutes_granted == 30
+    assert "midnight" in decision.reason
+
+
 def test_playtime_rules_ending_early_refunds_every_bank(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(

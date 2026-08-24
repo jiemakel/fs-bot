@@ -42,7 +42,7 @@
     "watcher.claims_auto_handled_header": "📋 {count} odottavaa pyyntöä käsitelty automaattisesti:",
     "watcher.ack_header": "📋 Hyväksytään {count} pyyntöä (yhteensä: {total}):",
     "watcher.profile_usage": "❌ Käyttö: profiili luettele|näytä <nimi>|määritä <nimi> <json>|käytä <profiili> <lapsi>",
-    "watcher.profile_invalid": "❌ Virheellinen profiili.",
+    "watcher.profile_invalid": "❌ Virheellinen profiili: {reason}",
     "watcher.profile_list_header": "Profiilit:",
     "watcher.profile_unknown": "❌ Tuntematon profiili: {profile_name}",
     "watcher.profile_switched": "✅ Lapsen {child_name} aktiiviseksi profiiliksi vaihdettiin '{profile_name}'.",
@@ -52,6 +52,7 @@
     "watcher.profile_summary": "Profiili: {name}\n  pankit (ensimmäinen on toiminta-/oletuspankki):\n{banks}\n  pelikatkot:\n{blackouts}",
     "watcher.profile_summary_bank": "    {bank_name}: +{weekly_addition}/viikko, maksimi {max_balance}",
     "watcher.profile_summary_recovery_bank": "    {bank_name}: palautuminen {recovery_rate}x onnistuneen tauon jälkeen, maksimi {max_balance}",
+    "watcher.profile_summary_day_bank": "    {bank_name}: +{weekly_addition} pelipäivää/viikko, maksimi {max_balance}, päivät {days}",
     "watcher.profile_summary_blackout_day": "  {day}: {periods}",
     "watcher.profile_summary_no_blackouts": "ei mitään",
     "watcher.help_admin": "🤖 Peliaikabotti - Ylläpitäjän komennot\n\nTILA:\n  • tila - Näytä kaikkien lasten peliaikatilanne\n  • pyydä [nimi] <kesto> - Testaa pyyntövirta\n\nHALLINTA:\n  • [nimi] [pankki] <kesto> - Lisää aikaa (oletuksena ensimmäinen pankki)\n  • [nimi] [pankki] +<kesto> - Lisää aikaa eksplisiittisesti\n  • [nimi] [pankki] -<kesto> - Vähennä aikaa\n  • [nimi] [pankki] =<kesto> - Aseta täsmällinen saldo\n  • lopeta [nimi] - Päätä aktiivinen sessio\n  • viikko [nimi] - Tee viikkosiirto viikkopankeille\n  • estä [nimi] - Kytke myöntämisen estotila päälle (päättää aktiivisen session)\n  • salli [nimi] - Poista myöntämisen estotila\n\nLISÄAIKAPYYNNÖT:\n  • pyynnöt [nimi] - Listaa odottavat lisäaikapyynnöt\n  • hyväksy [nimi] - Myönnä pyynnöt profiilin ensimmäiseen pankkiin\n\nPROFIILIT:\n  • profiili luettele - Listaa profiilit\n  • profiili näytä <nimi> - Näytä profiilin asetukset\n  • profiili määritä <nimi> <json> - Määritä profiili ja nimetyt pankit\n  • profiili käytä <nimi> <lapsi> - Aseta profiili lapselle\n    JSON-kentät: banks, blackouts\n    jokaisella pankilla on max_balance ja joko weekly_addition tai recovery_rate\n    banks on järjestetty olio; ensimmäinen avain on toiminta-/oletuspankki\n\nKestossa pitää olla yksikkö: h, m tai min (esim. 1h, 30m, 30min, 1.5h, 3x1h15m)\nHuom: [nimi] ja [pankki] ovat valinnaisia. Ilman nimeä komento koskee kaikkia lapsia.\n",
@@ -63,10 +64,12 @@
     "rules.partial_grant_summary": "Myönnettiin {granted} pyydetyn {requested} sijaan:",
     "rules.partial_grant_reason_bank": "• Pankki '{bank_name}' sallii nyt vain {available}.",
     "rules.partial_grant_reason_blackout": "• Ennen seuraavaa pelikatkoa mahtuu vain {available}.",
+    "rules.partial_grant_reason_day_boundary": "• Ennen pelipäiväpankin vaihtumista keskiyöllä mahtuu vain {available}.",
     "rules.grant_confirm": "✅ Myönnetty {minutes} peliaikaa.",
     "rules.added_now": "➕ Lisätty nyt: {minutes} (aktiivisen session yli menevä osa)",
     "rules.bank_balance": "🏦 {bank_name}: {balance}/{maximum} (+{weekly_addition}/viikko)",
     "rules.recovery_bank_balance": "⏱️ {bank_name}: {balance}/{maximum} (palautuu {recovery_rate}x onnistuneen tauon jälkeen)",
+    "rules.day_bank_balance": "📅 {bank_name}: {balance}/{maximum} pelipäivää (+{weekly_addition}/viikko; {days})",
     "rules.no_active_session": "Ei aktiivista sessiota päätettäväksi.",
     "rules.session_completed": "✅ Sessio päätetty. Pelattu {minutes}.",
     "rules.session_completed_credited": " ({minutes} hyvitetty takaisin pankkiin)",
@@ -83,9 +86,12 @@
     "rules.recovery_bank_progress": "  Palautuminen valmistuu vielä {remaining} tauon jälkeen.",
     "rules.bank_unknown": "❌ Tuntematon pankki '{bank_name}'. Vaihtoehdot: {bank_names}.",
     "rules.add_to_bank": "✅ Lisätty {actual_added} pankkiin '{bank_name}'. Uusi saldo: {bank}/{max_bank}.",
+    "rules.add_to_day_bank": "✅ Lisätty {actual_added} pelipäivää pankkiin '{bank_name}'. Uusi saldo: {bank}/{max_bank}.",
     "rules.set_bank": "✅ Pankki '{bank_name}' asetettu arvosta {old_balance} arvoon {new_balance}/{max_bank}.",
+    "rules.set_day_bank": "✅ Pankki '{bank_name}' asetettu arvosta {old_balance} arvoon {new_balance}/{max_bank} pelipäivää.",
     "rules.set_bank_capped": " (Rajattu pankin maksimiin.)",
     "rules.rollover_week": "🔄 Pankkien viikkosiirto valmis:",
-    "rules.rollover_bank": "• {bank_name}: lisätty {actual_added}; saldo {new_bank}/{max_bank}"
+    "rules.rollover_bank": "• {bank_name}: lisätty {actual_added}; saldo {new_bank}/{max_bank}",
+    "rules.rollover_day_bank": "• {bank_name}: lisätty {actual_added} pelipäivää; saldo {new_bank}/{max_bank}"
   }
 }

@@ -63,6 +63,13 @@ class PlaytimeStore:
                 minutes_debited INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (session_id, bank_name)
             );
+            CREATE TABLE IF NOT EXISTS play_day_taps (
+                child_id TEXT NOT NULL,
+                bank_name TEXT NOT NULL,
+                local_date TEXT NOT NULL,
+                session_id INTEGER NOT NULL,
+                PRIMARY KEY (child_id, bank_name, local_date)
+            );
             CREATE TABLE IF NOT EXISTS rule_profiles (
                 profile_name TEXT PRIMARY KEY,
                 banks_json TEXT NOT NULL,
@@ -118,6 +125,7 @@ class PlaytimeStore:
                     "weekly_addition_minutes": bank.weekly_addition_minutes,
                     "max_balance_minutes": bank.max_balance_minutes,
                     "recovery_rate": bank.recovery_rate,
+                    "days": bank.days,
                 }
                 for bank in banks.values()
             ],
@@ -135,6 +143,11 @@ class PlaytimeStore:
                 ),
                 max_balance_minutes=int(item["max_balance_minutes"]),
                 recovery_rate=None if item["recovery_rate"] is None else float(item["recovery_rate"]),
+                days=(
+                    None
+                    if item.get("days") is None
+                    else tuple(int(day) for day in item["days"])
+                ),
             )
             for item in loaded
         }
@@ -268,6 +281,39 @@ class PlaytimeStore:
             (session_id,),
         ).fetchall()
         return {row[0]: row[1] for row in rows}
+
+    def has_play_day_tap(self, child_id: str, bank_name: str, local_date: str) -> bool:
+        row = self._execute(
+            """SELECT 1 FROM play_day_taps
+               WHERE child_id = ? AND bank_name = ? AND local_date = ?;""",
+            (child_id, bank_name.lower(), local_date),
+        ).fetchone()
+        return row is not None
+
+    def tap_play_day(self, child_id: str, bank_name: str, local_date: str, session_id: int) -> bool:
+        """Record and charge a bank's first play on a local date atomically."""
+        with sqlite3.connect(self._db_path) as conn:
+            existing = conn.execute(
+                """SELECT 1 FROM play_day_taps
+                   WHERE child_id = ? AND bank_name = ? AND local_date = ?;""",
+                (child_id, bank_name.lower(), local_date),
+            ).fetchone()
+            if existing is not None:
+                return False
+            cursor = conn.execute(
+                """UPDATE bank SET balance_minutes = balance_minutes - 1, last_update_iso = ?
+                   WHERE child_id = ? AND bank_name = ? AND balance_minutes > 0;""",
+                (datetime.now(timezone.utc).isoformat(), child_id, bank_name.lower()),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"No play days available in bank {bank_name!r}.")
+            conn.execute(
+                """INSERT INTO play_day_taps (child_id, bank_name, local_date, session_id)
+                   VALUES (?, ?, ?, ?);""",
+                (child_id, bank_name.lower(), local_date, session_id),
+            )
+            conn.commit()
+        return True
 
     def get_active_session(self, child_id: str) -> ActiveSession | None:
         """Get the active session (session_id, start_time, minutes_granted) for a child if one exists."""

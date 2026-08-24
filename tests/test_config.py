@@ -97,6 +97,67 @@ def test_parse_profile_definition_requires_one_replenishment_policy_per_bank() -
         )
 
 
+def test_parse_profile_definition_accepts_day_banks() -> None:
+    profile = parse_rule_profile_definition(
+        "calendar",
+        {
+            "banks": {
+                "weekdays": {
+                    "days": ["mon", "tue", "wed", "thu", "fri"],
+                    "weekly_addition": 3,
+                    "max_balance": 5,
+                },
+                "weekends": {
+                    "days": ["sat", "sun"],
+                    "weekly_addition": "2d",
+                    "max_balance": "4d",
+                },
+            },
+            "blackouts": [],
+        },
+    )
+
+    assert profile.banks["weekdays"].days == (0, 1, 2, 3, 4)
+    assert profile.banks["weekdays"].weekly_addition_days == 3
+    assert profile.banks["weekends"].max_balance_days == 4
+
+
+def test_parse_profile_definition_accepts_and_normalizes_unicode_names() -> None:
+    profile = parse_rule_profile_definition(
+        "säännöt",
+        {
+            "banks": {
+                "arkipa\u0308iva\u0308t": {
+                    "days": ["mon", "tue", "wed", "thu", "fri"],
+                    "weekly_addition": 3,
+                    "max_balance": 4,
+                }
+            },
+            "blackouts": [],
+        },
+    )
+
+    assert profile.name == "säännöt"
+    assert profile.banks["arkipäivät"].name == "arkipäivät"
+
+
+def test_parse_profile_definition_rejects_invalid_day_bank_days() -> None:
+    with pytest.raises(ValueError, match="Invalid day bank day"):
+        parse_rule_profile_definition(
+            "invalid",
+            {
+                "banks": {
+                    "weekdays": {
+                        "days": ["workday"],
+                        "weekly_addition": 3,
+                        "max_balance": 5,
+                    }
+                },
+                "blackouts": [],
+            },
+        )
+
+
 def test_settings_parses_bot_language(monkeypatch) -> None:
     _set_minimal_env(monkeypatch)
     monkeypatch.setenv("BOT_LANGUAGE", "fi")

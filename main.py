@@ -1,7 +1,7 @@
 import logging
 import os
 
-from signalbot import SignalBot, enable_console_logging
+from signalbot import SignalBot
 
 from family_safety_bot.config import Settings
 from family_safety_bot.storage import PlaytimeStore
@@ -9,10 +9,9 @@ from family_safety_bot.watcher import PlaytimeManager
 
 
 def main() -> None:
-    enable_console_logging(logging.WARNING)
-
-    # enable_console_logging() only configures the "signalbot" logger.
-    # Configure root logging as well so family_safety_bot logs are visible.
+    # Configure application and dependency logging through the standard root
+    # logger. This works across signalbot releases without relying on its
+    # optional enable_console_logging helper.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s [%(levelname)s] - %(message)s",
@@ -20,6 +19,7 @@ def main() -> None:
     # Keep network/request tracing out of normal logs unless explicitly enabled.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("signalbot").setLevel(logging.WARNING)
 
     settings = Settings.from_env()
     store = PlaytimeStore(os.path.join(settings.data_dir, "playtime.sqlite3"))
@@ -31,13 +31,15 @@ def main() -> None:
             # Use signalbot's SQLite storage for internal state
             "storage": {
                 "type": "sqlite",
-                "sqlite_db": os.path.join(settings.data_dir, "signalbot.sqlite3"),
+                "db": os.path.join(settings.data_dir, "signalbot.sqlite3"),
             },
         }
     )
 
     # Register the playtime manager for the designated group
     manager = PlaytimeManager(settings=settings, store=store)
+    manager.bot = bot
+    manager.setup()
     bot.register(
         manager,
         contacts=False,

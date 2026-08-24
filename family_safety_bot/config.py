@@ -4,12 +4,12 @@ from dataclasses import dataclass
 from itertools import count
 import os
 from typing import Any
+import unicodedata
 
 from family_safety_bot.durations import parse_duration_minutes
 
 WEEKDAY_SUFFIXES = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 WEEKDAY_NAME_TO_INDEX = {suffix.lower(): i for i, suffix in enumerate(WEEKDAY_SUFFIXES)}
-_PROFILE_NAME_ALLOWED_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
 
 
 @dataclass(frozen=True)
@@ -28,10 +28,23 @@ class BankProfile:
     weekly_addition_minutes: int | None
     max_balance_minutes: int
     recovery_rate: float | None = None
+    days: tuple[int, ...] | None = None
 
     @property
     def is_recovery(self) -> bool:
         return self.recovery_rate is not None
+
+    @property
+    def is_day_bank(self) -> bool:
+        return self.days is not None
+
+    @property
+    def weekly_addition_days(self) -> int | None:
+        return self.weekly_addition_minutes if self.is_day_bank else None
+
+    @property
+    def max_balance_days(self) -> int | None:
+        return self.max_balance_minutes if self.is_day_bank else None
 
 
 @dataclass(frozen=True)
@@ -83,11 +96,11 @@ def parse_day_blackout_periods(
 
 
 def normalize_profile_name(name: str) -> str:
-    normalized = name.strip()
+    normalized = unicodedata.normalize("NFC", name.strip())
     if not normalized:
         raise ValueError("Profile name cannot be empty.")
-    if not all(ch in _PROFILE_NAME_ALLOWED_CHARS for ch in normalized):
-        raise ValueError("Profile name may only contain letters, numbers, '_' and '-'.")
+    if not all(ch.isalnum() or ch in "_-" for ch in normalized):
+        raise ValueError("Profile name may only contain Unicode letters, numbers, '_' and '-'.")
     return normalized
 
 
@@ -109,16 +122,52 @@ def parse_rule_profile_definition(name: str, definition: Any) -> RuleProfile:
         fields = set(raw_bank)
         weekly_fields = {"weekly_addition", "max_balance"}
         recovery_fields = {"recovery_rate", "max_balance"}
-        if fields not in (weekly_fields, recovery_fields):
-            raise ValueError("Each bank must define max_balance and exactly one replenishment policy.")
+        day_fields = {"days", "weekly_addition", "max_balance"}
+        if fields not in (weekly_fields, recovery_fields, day_fields):
+            raise ValueError(
+                "Each bank must define max_balance and exactly one replenishment policy; "
+                "day banks also define days."
+            )
         bank_name = normalize_profile_name(str(raw_name))
-        max_minutes = parse_duration_minutes(str(raw_bank["max_balance"]))
+        bank_days: tuple[int, ...] | None = None
+        if fields == day_fields:
+            raw_days = raw_bank["days"]
+            if not isinstance(raw_days, list) or not raw_days:
+                raise ValueError(f"Day bank {bank_name!r} must contain at least one day.")
+            parsed_days: list[int] = []
+            for day in raw_days:
+                day_key = str(day).lower()
+                if day_key not in WEEKDAY_NAME_TO_INDEX:
+                    raise ValueError(f"Invalid day bank day: {day!r}.")
+                weekday = WEEKDAY_NAME_TO_INDEX[day_key]
+                if weekday in parsed_days:
+                    raise ValueError(f"Duplicate day in bank {bank_name!r}: {day!r}.")
+                parsed_days.append(weekday)
+            bank_days = tuple(parsed_days)
+
+            def parse_day_count(value: Any) -> int | None:
+                if isinstance(value, bool):
+                    return None
+                if isinstance(value, int):
+                    return value
+                text = str(value).strip().lower()
+                if text.endswith("d"):
+                    text = text[:-1].strip()
+                return int(text) if text.isdigit() else None
+
+            max_minutes = parse_day_count(raw_bank["max_balance"])
+        else:
+            max_minutes = parse_duration_minutes(str(raw_bank["max_balance"]))
         if max_minutes is None or max_minutes <= 0:
             raise ValueError(f"Invalid maximum balance for bank {bank_name!r}.")
         weekly_minutes: int | None = None
         recovery_rate: float | None = None
-        if fields == weekly_fields:
-            weekly_minutes = parse_duration_minutes(str(raw_bank["weekly_addition"]))
+        if fields in (weekly_fields, day_fields):
+            weekly_minutes = (
+                parse_day_count(raw_bank["weekly_addition"])
+                if fields == day_fields
+                else parse_duration_minutes(str(raw_bank["weekly_addition"]))
+            )
             if weekly_minutes is None or weekly_minutes <= 0:
                 raise ValueError(f"Invalid weekly addition for bank {bank_name!r}.")
         else:
@@ -129,7 +178,7 @@ def parse_rule_profile_definition(name: str, definition: Any) -> RuleProfile:
         key = bank_name.lower()
         if key in banks:
             raise ValueError(f"Duplicate bank name: {bank_name!r}.")
-        banks[key] = BankProfile(bank_name, weekly_minutes, max_minutes, recovery_rate)
+        banks[key] = BankProfile(bank_name, weekly_minutes, max_minutes, recovery_rate, bank_days)
 
     raw_blackouts = definition["blackouts"]
     if not isinstance(raw_blackouts, list):

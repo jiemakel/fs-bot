@@ -36,7 +36,9 @@ Child names are case-insensitive for commands and must be unique after lowercasi
 
 Rule settings are stored in profiles created through Signal admin commands. There are no environment defaults. A profile must be defined and assigned before playtime functionality is enabled for a child.
 
-Each profile has one or more named banks. Every bank must have enough balance for a grant, and the granted amount is deducted from every bank. Each bank has a maximum balance and exactly one replenishment policy: `weekly_addition` or `recovery_rate`. Banks are a JSON object, and its first key is the default target for activity claims and balance commands.
+Each profile has one or more named banks. Ordinary time and recovery banks must all have enough minutes for a grant, and the granted minutes are deducted from each of them. Each has a maximum balance and exactly one replenishment policy: `weekly_addition` or `recovery_rate`. Banks are a JSON object, and its first key is the default target for activity claims and balance commands.
+
+A play-day bank adds a `days` array and uses integer day credits for `weekly_addition` and `max_balance`. It only applies on the listed weekdays. The first successful grant on a matching local calendar day requires and deducts one credit; any later grants that same day reuse that tap. Nonmatching play-day banks are ignored. With any play-day bank in a profile, grants stop at local midnight so the next day's matching bank is checked before play continues. Day values accept positive integers (`3`) or a string with a `d` suffix (`"3d"`).
 
 A recovery bank starts full. After play deducts from it, the missing balance is restored only when an uninterrupted break of `missing balance / recovery_rate` completes. Starting play resets break progress, except that stopping within one minute restores the progress that existed before the interruption.
 
@@ -82,6 +84,7 @@ Each item in the profile's `blackouts` array has `days`, `start`, and `end`. `da
 - `[name] [bank] +<duration>` - Add time explicitly.
 - `[name] [bank] -<duration>` - Remove time.
 - `[name] [bank] =<duration>` - Set a bank to an exact value.
+- For a named play-day bank, use a whole day-credit amount with `d`, for example `weekdays +2d` or `weekends =1d`.
 - `end [name]` - End a child's active session.
 - `rollover [name]` - Force weekly rollover.
 - `block [name]` - Enable grant block mode and end any active session.
@@ -97,14 +100,16 @@ Each item in the profile's `blackouts` array has `days`, `start`, and `end`. `da
 
 ### Profile Definition JSON
 
-The JSON object requires exactly `banks` and `blackouts`. Each bank requires `max_balance` plus exactly one of `weekly_addition` or `recovery_rate`. Object order is significant only for `banks`: the first bank is the activity/default bank.
+The JSON object requires exactly `banks` and `blackouts`. A time bank requires `max_balance` plus exactly one of `weekly_addition` or `recovery_rate`. A play-day bank requires `days`, `weekly_addition`, and `max_balance`. Object order is significant only for `banks`: the first bank is the activity/default bank, so a time bank is normally placed first.
 
 ```json
 {
   "banks": {
     "earned": {"weekly_addition": "14h", "max_balance": "42h"},
     "weekly": {"weekly_addition": "30h", "max_balance": "30h"},
-    "recovery": {"recovery_rate": 3.0, "max_balance": "3h"}
+    "recovery": {"recovery_rate": 3.0, "max_balance": "3h"},
+    "weekdays": {"days": ["mon", "tue", "wed", "thu", "fri"], "weekly_addition": 3, "max_balance": 5},
+    "weekends": {"days": ["sat", "sun"], "weekly_addition": 2, "max_balance": 2}
   },
   "blackouts": [
     {"days": ["mon", "tue", "wed", "thu", "fri"], "start": "00:00", "end": "08:00"},
@@ -123,7 +128,9 @@ The command accepts whitespace and newlines inside the JSON, so this structure c
 - If Microsoft grant/authentication fails, the request is rejected and local state is unchanged.
 - Ending a session first applies an immediate Microsoft block; if that block fails, the session is not ended locally.
 - Partial grants give the maximum currently allowed time when any bank or blackout limit prevents the full request.
-- Every grant deducts from every bank in the active profile.
+- Every grant deducts minutes from every ordinary bank in the active profile. It deducts one credit from each matching, previously untapped play-day bank.
+- Play-day taps are stored by child, bank, and local date; multiple sessions on one date cost only one credit per matching bank.
+- Profiles containing play-day banks cap grants at local midnight.
 - Activity rewards and unspecified balance commands target the profile's first bank.
 - Ending early returns unused time to every bank debited for that session.
 - Bank balances are stored by child and bank name independently of profiles. Switching profiles preserves them even when a balance exceeds the new maximum; a later rollover may clamp the balance to the active profile's maximum.

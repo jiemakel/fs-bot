@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 import httpx
-from signalbot import Command, Context
+from signalbot import DataMessageContext, DataMessageHandler, SendMessage, SignalBot
 
 from family_safety_bot.config import (
     Child,
@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 NUMERIC_ONLY_RE = re.compile(r"^\d+(?:\.\d+)?$")
 HAS_DIGIT_RE = re.compile(r"\d")
 TEXT_MENTION_RE = re.compile(r"(^|\s)@\S+")
+DAY_BANK_AMOUNT_RE = re.compile(r"^([+\-=]?)(\d+)\s*d(?:ays?)?$", re.IGNORECASE)
 IMPLICIT_HELP_MAX_CHARS = 80
 _COMMAND_KEYS = (
     "status",
@@ -47,11 +48,12 @@ _COMMAND_KEYS = (
     "admin_profile_define",
     "admin_profile_use",
 )
-class PlaytimeManager(Command):
+
+
+class PlaytimeManager(DataMessageHandler):
     """Handle playtime requests via Signal commands."""
     
     def __init__(self, settings: Settings, store: PlaytimeStore) -> None:
-        super().__init__()
         self._settings = settings
         self._store = store
         self._i18n = I18n(settings.bot_language)
@@ -78,6 +80,7 @@ class PlaytimeManager(Command):
         self._ms_api_lock = asyncio.Lock()
         self._profiles_by_name: dict[str, RuleProfile] = {}
         self._active_profile_name_by_child: dict[str, str] = {}
+        self.bot: SignalBot | None = None
         self._initialize_profiles()
 
         self._rules_by_child = {
@@ -122,7 +125,7 @@ class PlaytimeManager(Command):
     
     async def _resolve_child(
         self,
-        ctx: Context,
+        ctx: DataMessageContext,
         child_name: str,
     ) -> tuple[Child, PlaytimeRules] | None:
         found = self._children_by_name.get(child_name.lower())
@@ -130,11 +133,11 @@ class PlaytimeManager(Command):
             return found
         names = ", ".join(c.name for c in self._settings.children.values())
         await ctx.send(
-            self._i18n.msg(
+            SendMessage(text=self._i18n.msg(
                 "watcher.child_not_found",
                 child_name=child_name,
                 names=names,
-            )
+            ))
         )
         return None
 
@@ -146,7 +149,7 @@ class PlaytimeManager(Command):
 
     async def _parse_children_and_minutes(
         self,
-        ctx: Context,
+        ctx: DataMessageContext,
         payload: str,
         parse_minutes: Callable[[str], int | None],
     ) -> tuple[list[tuple[Child, PlaytimeRules]], int, bool] | None:
@@ -170,7 +173,7 @@ class PlaytimeManager(Command):
 
     async def _parse_children_payload(
         self,
-        ctx: Context,
+        ctx: DataMessageContext,
         payload: str,
     ) -> list[tuple[Child, PlaytimeRules]] | None:
         child_name = payload.strip()
@@ -196,15 +199,28 @@ class PlaytimeManager(Command):
         )
         bank_lines = "\n".join(
             self._i18n.msg(
-                "watcher.profile_summary_recovery_bank" if bank.is_recovery else "watcher.profile_summary_bank",
+                (
+                    "watcher.profile_summary_day_bank"
+                    if bank.is_day_bank
+                    else "watcher.profile_summary_recovery_bank"
+                    if bank.is_recovery
+                    else "watcher.profile_summary_bank"
+                ),
                 bank_name=bank.name,
                 weekly_addition=(
-                    format_duration(bank.weekly_addition_minutes)
+                    str(bank.weekly_addition_minutes)
+                    if bank.is_day_bank
+                    else format_duration(bank.weekly_addition_minutes)
                     if bank.weekly_addition_minutes is not None
                     else ""
                 ),
-                max_balance=format_duration(bank.max_balance_minutes),
+                max_balance=(
+                    str(bank.max_balance_minutes)
+                    if bank.is_day_bank
+                    else format_duration(bank.max_balance_minutes)
+                ),
                 recovery_rate=f"{bank.recovery_rate:g}" if bank.recovery_rate is not None else "",
+                days=", ".join(WEEKDAY_SUFFIXES[day].lower() for day in bank.days or ()),
             )
             for bank in profile.banks.values()
         )
@@ -215,10 +231,10 @@ class PlaytimeManager(Command):
             blackouts=blackout_lines,
         )
 
-    async def _handle_profile_command(self, ctx: Context, payload: str) -> None:
+    async def _handle_profile_command(self, ctx: DataMessageContext, payload: str) -> None:
         payload = payload.strip()
         if not payload:
-            await ctx.send(self._i18n.msg("watcher.profile_usage"))
+            await ctx.send(SendMessage(text=self._i18n.msg("watcher.profile_usage")))
             return
 
         parts = payload.split()
@@ -228,7 +244,7 @@ class PlaytimeManager(Command):
             await self._do_profile_define(ctx, payload)
             return
 
-        handlers: dict[str, Callable[[Context, list[str]], Awaitable[None]]] = {
+        handlers: dict[str, Callable[[DataMessageContext, list[str]], Awaitable[None]]] = {
             "admin_profile_list": self._do_profile_list,
             "admin_profile_show": self._do_profile_show,
             "admin_profile_use": self._do_profile_use,
@@ -239,39 +255,39 @@ class PlaytimeManager(Command):
                 await handler(ctx, parts)
                 return
 
-        await ctx.send(self._i18n.msg("watcher.profile_usage"))
+        await ctx.send(SendMessage(text=self._i18n.msg("watcher.profile_usage")))
 
-    async def _do_profile_list(self, ctx: Context, parts: list[str]) -> None:
+    async def _do_profile_list(self, ctx: DataMessageContext, parts: list[str]) -> None:
         ordered = sorted(self._profiles_by_name.values(), key=lambda p: p.name.lower())
         lines = [
             f"* {profile.name}"
             for profile in ordered
         ]
-        await ctx.send(self._i18n.msg("watcher.profile_list_header") + "\n" + "\n".join(lines))
+        await ctx.send(SendMessage(text=self._i18n.msg("watcher.profile_list_header") + "\n" + "\n".join(lines)))
 
-    async def _do_profile_show(self, ctx: Context, parts: list[str]) -> None:
+    async def _do_profile_show(self, ctx: DataMessageContext, parts: list[str]) -> None:
         if len(parts) != 2:
-            await ctx.send(self._i18n.msg("watcher.profile_usage"))
+            await ctx.send(SendMessage(text=self._i18n.msg("watcher.profile_usage")))
             return
         profile = self._profiles_by_name.get(parts[1].lower())
         if profile is None:
-            await ctx.send(self._i18n.msg("watcher.profile_unknown", profile_name=parts[1]))
+            await ctx.send(SendMessage(text=self._i18n.msg("watcher.profile_unknown", profile_name=parts[1])))
             return
-        await ctx.send(self._profile_summary(profile))
+        await ctx.send(SendMessage(text=self._profile_summary(profile)))
 
-    async def _do_profile_use(self, ctx: Context, parts: list[str]) -> None:
+    async def _do_profile_use(self, ctx: DataMessageContext, parts: list[str]) -> None:
         if len(parts) != 3:
-            await ctx.send(self._i18n.msg("watcher.profile_usage"))
+            await ctx.send(SendMessage(text=self._i18n.msg("watcher.profile_usage")))
             return
         profile = self._profiles_by_name.get(parts[1].lower())
         if profile is None:
-            await ctx.send(self._i18n.msg("watcher.profile_unknown", profile_name=parts[1]))
+            await ctx.send(SendMessage(text=self._i18n.msg("watcher.profile_unknown", profile_name=parts[1])))
             return
         if parts[2] == "*":
             for phone, child in self._settings.children.items():
                 self._active_profile_name_by_child[phone] = profile.name
                 self._store.set_active_rule_profile_name_for_child(phone, profile.name)
-                await ctx.send(self._i18n.msg("watcher.profile_switched", child_name=child.name, profile_name=profile.name))
+                await ctx.send(SendMessage(text=self._i18n.msg("watcher.profile_switched", child_name=child.name, profile_name=profile.name)))
         else:
             resolved = await self._resolve_child(ctx, parts[2])
             if not resolved:
@@ -279,35 +295,39 @@ class PlaytimeManager(Command):
             child, _ = resolved
             self._active_profile_name_by_child[child.phone_number] = profile.name
             self._store.set_active_rule_profile_name_for_child(child.phone_number, profile.name)
-            await ctx.send(self._i18n.msg("watcher.profile_switched", child_name=child.name, profile_name=profile.name))
+            await ctx.send(SendMessage(text=self._i18n.msg("watcher.profile_switched", child_name=child.name, profile_name=profile.name)))
 
-    async def _do_profile_define(self, ctx: Context, payload: str) -> None:
+    async def _do_profile_define(self, ctx: DataMessageContext, payload: str) -> None:
         parts = payload.split(maxsplit=2)
         if len(parts) != 3:
-            await ctx.send(self._i18n.msg("watcher.profile_usage"))
+            await ctx.send(SendMessage(text=self._i18n.msg("watcher.profile_usage")))
             return
         try:
             definition = json.loads(parts[2])
             created = parse_rule_profile_definition(parts[1], definition)
-        except (json.JSONDecodeError, ValueError):
-            await ctx.send(self._i18n.msg("watcher.profile_invalid"))
+        except (json.JSONDecodeError, ValueError) as exc:
+            await ctx.send(
+                SendMessage(text=self._i18n.msg("watcher.profile_invalid", reason=str(exc)))
+            )
             return
         try:
             self._store.upsert_rule_profile(created)
         except sqlite3.Error:
             logger.exception("Failed to save rule profile %s", created.name)
-            await ctx.send(self._i18n.msg("watcher.profile_save_failed", profile_name=created.name))
+            await ctx.send(SendMessage(text=self._i18n.msg("watcher.profile_save_failed", profile_name=created.name)))
             return
         self._profiles_by_name[created.name.lower()] = created
         await ctx.send(
-            self._i18n.msg("watcher.profile_defined", profile_name=created.name)
-            + "\n"
-            + self._profile_summary(created)
+            SendMessage(
+                text=self._i18n.msg("watcher.profile_defined", profile_name=created.name)
+                + "\n"
+                + self._profile_summary(created)
+            )
         )
 
     async def _run_for_resolved_children(
         self,
-        ctx: Context,
+        ctx: DataMessageContext,
         payload: str,
         action: Callable[[Child, PlaytimeRules], Awaitable[None]],
     ) -> bool:
@@ -320,7 +340,7 @@ class PlaytimeManager(Command):
 
     async def _run_for_resolved_children_and_minutes(
         self,
-        ctx: Context,
+        ctx: DataMessageContext,
         payload: str,
         parse_minutes: Callable[[str], int | None],
         action: Callable[[Child, PlaytimeRules, int, bool], Awaitable[None]],
@@ -333,7 +353,7 @@ class PlaytimeManager(Command):
             await action(child, rules, minutes, is_relative)
         return True
 
-    async def _handle_admin_command(self, ctx: Context, message_text: str) -> bool:
+    async def _handle_admin_command(self, ctx: DataMessageContext, message_text: str) -> bool:
         parts = message_text.split(maxsplit=1)
         if not parts:
             return False
@@ -346,8 +366,8 @@ class PlaytimeManager(Command):
 
         return await self._handle_admin_bank_command(ctx, message_text)
 
-    async def _send_admin_result(self, ctx: Context, child: Child, message: str) -> None:
-        await ctx.send(self._i18n.msg("watcher.admin_prefix", child_name=child.name, message=message))
+    async def _send_admin_result(self, ctx: DataMessageContext, child: Child, message: str) -> None:
+        await ctx.send(SendMessage(text=self._i18n.msg("watcher.admin_prefix", child_name=child.name, message=message)))
 
     def _format_child_status_section(self, child_id: str, child: Child) -> str:
         lines = [f"[{child.name}]"]
@@ -361,7 +381,7 @@ class PlaytimeManager(Command):
             lines.append(self._format_claims_response(child, claims))
         return "\n".join(lines)
 
-    def _should_send_implicit_help(self, ctx: Context, message_text: str) -> bool:
+    def _should_send_implicit_help(self, ctx: DataMessageContext, message_text: str) -> bool:
         """Return true only for short, likely-command messages.
 
         Explicit help commands always work; this only gates the noisy fallback
@@ -377,25 +397,25 @@ class PlaytimeManager(Command):
             return False
         return not (getattr(message, "mentions", None) or TEXT_MENTION_RE.search(message_text))
 
-    async def _handle_admin_block_command(self, ctx: Context, payload: str) -> bool:
+    async def _handle_admin_block_command(self, ctx: DataMessageContext, payload: str) -> bool:
         return await self._run_for_resolved_children(ctx, payload, lambda c, r: self.admin_block_child_command(ctx, c, r))
 
-    async def _handle_admin_unblock_command(self, ctx: Context, payload: str) -> bool:
+    async def _handle_admin_unblock_command(self, ctx: DataMessageContext, payload: str) -> bool:
         return await self._run_for_resolved_children(ctx, payload, lambda c, r: self._unblock_action(ctx, c))
 
-    async def _unblock_action(self, ctx: Context, child: Child) -> None:
+    async def _unblock_action(self, ctx: DataMessageContext, child: Child) -> None:
         self._store.set_child_block_mode(child.phone_number, False)
-        await ctx.send(self._i18n.msg("watcher.admin_child_unblocked", child_name=child.name))
+        await ctx.send(SendMessage(text=self._i18n.msg("watcher.admin_child_unblocked", child_name=child.name)))
 
-    async def _handle_admin_test_command(self, ctx: Context, payload: str) -> bool:
+    async def _handle_admin_test_command(self, ctx: DataMessageContext, payload: str) -> bool:
         return await self._run_for_resolved_children_and_minutes(
             ctx, payload, parse_duration_minutes, lambda c, r, m, _: self.request_command(ctx, c, r, m, c.name + " (TEST)")
         )
 
-    async def _handle_admin_end_command(self, ctx: Context, payload: str) -> bool:
+    async def _handle_admin_end_command(self, ctx: DataMessageContext, payload: str) -> bool:
         return await self._run_for_resolved_children(ctx, payload, lambda c, r: self.admin_end_session_command(ctx, c, r))
 
-    async def _handle_admin_rollover_command(self, ctx: Context, payload: str) -> bool:
+    async def _handle_admin_rollover_command(self, ctx: DataMessageContext, payload: str) -> bool:
         async def action(child: Child, rules: PlaytimeRules) -> None:
             if not self._has_profile(child.phone_number):
                 await self._send_admin_result(ctx, child, self._i18n.msg("watcher.profile_not_assigned"))
@@ -403,27 +423,27 @@ class PlaytimeManager(Command):
             await self._send_admin_result(ctx, child, rules.rollover_week())
         return await self._run_for_resolved_children(ctx, payload, action)
 
-    async def _handle_admin_profile_command(self, ctx: Context, payload: str) -> bool:
+    async def _handle_admin_profile_command(self, ctx: DataMessageContext, payload: str) -> bool:
         await self._handle_profile_command(ctx, payload)
         return True
 
-    async def _handle_admin_claims_command(self, ctx: Context, payload: str) -> bool:
+    async def _handle_admin_claims_command(self, ctx: DataMessageContext, payload: str) -> bool:
         async def action(child: Child, _rules: PlaytimeRules) -> None:
             claims = self._store.get_pending_claims(child.phone_number)
             if not claims:
-                await ctx.send(self._i18n.msg("watcher.no_pending_claims", child_name=child.name))
+                await ctx.send(SendMessage(text=self._i18n.msg("watcher.no_pending_claims", child_name=child.name)))
                 return
-            await ctx.send(self._format_claims_response(child, claims))
+            await ctx.send(SendMessage(text=self._format_claims_response(child, claims)))
         return await self._run_for_resolved_children(ctx, payload, action)
 
-    async def _handle_admin_ack_command(self, ctx: Context, payload: str) -> bool:
+    async def _handle_admin_ack_command(self, ctx: DataMessageContext, payload: str) -> bool:
         async def action(child: Child, rules: PlaytimeRules) -> None:
             if not self._has_profile(child.phone_number):
                 await self._send_admin_result(ctx, child, self._i18n.msg("watcher.profile_not_assigned"))
                 return
             claims = self._store.get_pending_claims(child.phone_number)
             if not claims:
-                await ctx.send(self._i18n.msg("watcher.no_pending_claims", child_name=child.name))
+                await ctx.send(SendMessage(text=self._i18n.msg("watcher.no_pending_claims", child_name=child.name)))
                 return
             total_minutes = sum(c.claimed_minutes for c in claims)
             self._store.mark_all_claims_handled(child.phone_number, total_minutes)
@@ -436,7 +456,7 @@ class PlaytimeManager(Command):
             await self._send_admin_result(ctx, child, full_message)
         return await self._run_for_resolved_children(ctx, payload, action)
 
-    async def _handle_admin_bank_command(self, ctx: Context, message_text: str) -> bool:
+    async def _handle_admin_bank_command(self, ctx: DataMessageContext, message_text: str) -> bool:
         parsed = self._parse_admin_bank_payload(message_text)
         if parsed is None:
             return False
@@ -473,7 +493,13 @@ class PlaytimeManager(Command):
 
         def parsed_duration(text: str) -> tuple[int, bool] | None:
             minutes = parse_signed_duration_minutes(text)
-            return None if minutes is None else (minutes, not text.lstrip().startswith("="))
+            if minutes is not None:
+                return minutes, not text.lstrip().startswith("=")
+            if match := DAY_BANK_AMOUNT_RE.fullmatch(text.strip()):
+                sign, raw_amount = match.groups()
+                amount = int(raw_amount) * (-1 if sign == "-" else 1)
+                return amount, sign != "="
+            return None
 
         first_is_all_children = parts[0] == "*"
         child_rules_entry = None if first_is_all_children else self._children_by_name.get(parts[0].lower())
@@ -498,6 +524,8 @@ class PlaytimeManager(Command):
 
     def setup(self) -> None:
         """Set up scheduled tasks."""
+        if self.bot is None:
+            raise RuntimeError("PlaytimeManager must be attached to a SignalBot before setup.")
         # Weekly rollover check - run Monday at 00:01
         self.bot.scheduler.add_job(  # type: ignore[union-attr]
             self._check_weekly_rollover,
@@ -521,7 +549,7 @@ class PlaytimeManager(Command):
         )
         logger.info("Scheduled session and recovery-bank checks every minute")
 
-    async def handle(self, context: Context) -> None:
+    async def handle_data_message(self, context: DataMessageContext) -> None:
         """Handle incoming messages from the group."""
         raw_text = context.message.text
         if raw_text is None:
@@ -530,7 +558,7 @@ class PlaytimeManager(Command):
         if not message_text:
             return
         message_lower = message_text.lower()
-        sender = context.message.source
+        sender = context.message.source_number or context.message.source
         
         is_admin = sender in self._settings.signal_admins
         child = self._settings.children.get(sender)
@@ -543,12 +571,16 @@ class PlaytimeManager(Command):
         sender_name = child.name if child is not None else "Admin"
         
         if message_lower in self._commands["help"]:
-            await context.send(self._i18n.msg("watcher.help_admin" if is_admin else "watcher.help_child"))
+            await context.send(
+                SendMessage(
+                    text=self._i18n.msg("watcher.help_admin" if is_admin else "watcher.help_child")
+                )
+            )
             return
 
         if message_lower in self._commands["status"]:
             for phone, child_obj in self._settings.children.items():
-                await context.send(self._format_child_status_section(phone, child_obj))
+                await context.send(SendMessage(text=self._format_child_status_section(phone, child_obj)))
             return
 
         parsed_minutes = parse_duration_minutes(message_text)
@@ -565,7 +597,11 @@ class PlaytimeManager(Command):
                 return
 
         if child_context is not None and NUMERIC_ONLY_RE.match(message_text):
-            await context.send(self._i18n.msg("watcher.numeric_unit_required", sender_name=sender_name))
+            await context.send(
+                SendMessage(
+                    text=self._i18n.msg("watcher.numeric_unit_required", sender_name=sender_name)
+                )
+            )
             return
 
         if message_lower in self._commands["end"] and child_context is not None:
@@ -577,7 +613,11 @@ class PlaytimeManager(Command):
             return
         
         if self._should_send_implicit_help(context, message_text):
-            await context.send(self._i18n.msg("watcher.help_admin" if is_admin else "watcher.help_child"))
+            await context.send(
+                SendMessage(
+                    text=self._i18n.msg("watcher.help_admin" if is_admin else "watcher.help_child")
+                )
+            )
 
     async def _call_ms_api_with_retry(
         self,
@@ -617,7 +657,7 @@ class PlaytimeManager(Command):
 
     async def _complete_session_after_block(
         self,
-        ctx: Context,
+        ctx: DataMessageContext,
         child: Child,
         rules: PlaytimeRules,
         error_message: str,
@@ -632,16 +672,16 @@ class PlaytimeManager(Command):
             block_success = await self._block_via_ms_api(child.ms_account_id)
         except (ValueError, RuntimeError, httpx.HTTPError):
             logger.exception("Failed to block time via Microsoft API")
-            await ctx.send(prefix + error_message)
+            await ctx.send(SendMessage(text=prefix + error_message))
             return None
         if not block_success:
-            await ctx.send(prefix + rejected_message)
+            await ctx.send(SendMessage(text=prefix + rejected_message))
             return None
         return rules.complete_session()
 
     async def request_command(
         self,
-        ctx: Context,
+        ctx: DataMessageContext,
         child: Child,
         rules: PlaytimeRules,
         minutes: int,
@@ -649,42 +689,42 @@ class PlaytimeManager(Command):
     ) -> None:
         """Handle a playtime request from child."""
         if minutes <= 0:
-            await ctx.send(self._i18n.msg("watcher.positive_duration_required", sender_name=sender_name))
+            await ctx.send(SendMessage(text=self._i18n.msg("watcher.positive_duration_required", sender_name=sender_name)))
             return
 
         if not self._has_profile(child.phone_number):
             await ctx.send(
-                self._i18n.msg(
+                SendMessage(text=self._i18n.msg(
                     "watcher.request_denied",
                     sender_name=sender_name,
                     reason=self._i18n.msg("watcher.profile_not_assigned"),
-                )
+                ))
             )
             return
 
         if self._store.is_child_block_mode_enabled(child.phone_number):
             await ctx.send(
-                self._i18n.msg(
+                SendMessage(text=self._i18n.msg(
                     "watcher.request_denied",
                     sender_name=sender_name,
                     reason=self._i18n.msg("watcher.request_blocked_by_admin"),
-                )
+                ))
             )
             return
 
         decision = rules.evaluate_request(minutes)
         if not decision.allowed:
-            await ctx.send(self._i18n.msg("watcher.request_denied", sender_name=sender_name, reason=decision.reason))
+            await ctx.send(SendMessage(text=self._i18n.msg("watcher.request_denied", sender_name=sender_name, reason=decision.reason)))
             return
 
         try:
             grant_success = await self._grant_via_ms_api(child.ms_account_id, decision.minutes_granted)
         except (ValueError, RuntimeError, httpx.HTTPError):
             logger.exception("Failed to grant time via Microsoft API")
-            await ctx.send(self._i18n.msg("watcher.request_grant_error", sender_name=sender_name))
+            await ctx.send(SendMessage(text=self._i18n.msg("watcher.request_grant_error", sender_name=sender_name)))
             return
         if not grant_success:
-            await ctx.send(self._i18n.msg("watcher.request_grant_failed", sender_name=sender_name))
+            await ctx.send(SendMessage(text=self._i18n.msg("watcher.request_grant_failed", sender_name=sender_name)))
             return
 
         _, message = rules.grant_playtime(decision.minutes_granted)
@@ -692,14 +732,14 @@ class PlaytimeManager(Command):
         if decision.reason:
             response += f"\n{decision.reason}"
         response += f"\n{message}"
-        await ctx.send(response)
+        await ctx.send(SendMessage(text=response))
 
-    async def admin_block_child_command(self, ctx: Context, child: Child, rules: PlaytimeRules) -> None:
+    async def admin_block_child_command(self, ctx: DataMessageContext, child: Child, rules: PlaytimeRules) -> None:
         """Enable grant block mode for a child and end any active session."""
         self._store.set_child_block_mode(child.phone_number, True)
         block_msg = self._i18n.msg("watcher.admin_child_blocked", child_name=child.name)
         if not self._has_profile(child.phone_number):
-            await ctx.send(block_msg)
+            await ctx.send(SendMessage(text=block_msg))
             return
         result = await self._complete_session_after_block(
             ctx,
@@ -713,14 +753,16 @@ class PlaytimeManager(Command):
         if result is None:
             return
         if not result:
-            await ctx.send(block_msg)
+            await ctx.send(SendMessage(text=block_msg))
             return
         await ctx.send(
-            block_msg + "\n"
-            + self._i18n.msg("watcher.admin_end_session", child_name=child.name, result=result)
+            SendMessage(
+                text=block_msg + "\n"
+                + self._i18n.msg("watcher.admin_end_session", child_name=child.name, result=result)
+            )
         )
 
-    async def admin_end_session_command(self, ctx: Context, child: Child, rules: PlaytimeRules) -> None:
+    async def admin_end_session_command(self, ctx: DataMessageContext, child: Child, rules: PlaytimeRules) -> None:
         """Admin end active session."""
         if not self._has_profile(child.phone_number):
             await self._send_admin_result(ctx, child, self._i18n.msg("watcher.profile_not_assigned"))
@@ -734,17 +776,17 @@ class PlaytimeManager(Command):
         )
         if result is None:
             return
-        await ctx.send(self._i18n.msg("watcher.admin_end_session", child_name=child.name, result=result))
+        await ctx.send(SendMessage(text=self._i18n.msg("watcher.admin_end_session", child_name=child.name, result=result)))
 
     async def end_session_command(
         self,
-        ctx: Context,
+        ctx: DataMessageContext,
         child: Child,
         rules: PlaytimeRules,
         sender_name: str,
     ) -> None:
         if not self._has_profile(child.phone_number):
-            await ctx.send(f"[{sender_name}]\n" + self._i18n.msg("watcher.profile_not_assigned"))
+            await ctx.send(SendMessage(text=f"[{sender_name}]\n" + self._i18n.msg("watcher.profile_not_assigned")))
             return
         result = await self._complete_session_after_block(
             ctx,
@@ -755,7 +797,7 @@ class PlaytimeManager(Command):
         )
         if result is None:
             return
-        await ctx.send(f"[{sender_name}]\n{result}")
+        await ctx.send(SendMessage(text=f"[{sender_name}]\n{result}"))
 
     async def _check_weekly_rollover(self) -> None:
         """Scheduled task to handle weekly rollover for all children."""
@@ -770,7 +812,7 @@ class PlaytimeManager(Command):
         # Send to group
         try:
             combined_message = self._i18n.msg("watcher.weekly_rollover_header") + "\n\n" + "\n\n".join(results)
-            await self.bot.send(self._settings.signal_group_id, combined_message)  # type: ignore[union-attr]
+            await self._send_group(combined_message)
         except Exception:
             logger.exception("Failed to send rollover notification to group")
 
@@ -789,13 +831,18 @@ class PlaytimeManager(Command):
             return
 
         try:
-            await self.bot.send(self._settings.signal_group_id, "\n\n".join(results))  # type: ignore[union-attr]
+            await self._send_group("\n\n".join(results))
         except Exception:
             logger.exception("Failed to send scheduled notification to group")
 
+    async def _send_group(self, text: str) -> None:
+        if self.bot is None:
+            raise RuntimeError("PlaytimeManager is not attached to a SignalBot.")
+        await self.bot.messages.send(SendMessage(text=text), self._settings.signal_group_id)
+
     async def claim_command(
         self,
-        ctx: Context,
+        ctx: DataMessageContext,
         child: Child,
         minutes: int,
         description: str,
@@ -806,12 +853,12 @@ class PlaytimeManager(Command):
             child.phone_number, minutes, description, datetime.now(timezone.utc)
         )
         await ctx.send(
-            self._i18n.msg(
+            SendMessage(text=self._i18n.msg(
                 "watcher.claim_received",
                 sender_name=sender_name,
                 minutes=format_duration(minutes),
                 description=description,
-            )
+            ))
         )
 
     def _format_claims_block(self, claims: list[ActivityClaim]) -> str:

@@ -7,7 +7,13 @@ from typing import Callable
 
 from dateutil import tz
 
-from family_safety_bot.config import BankProfile, RuleProfile, Settings, parse_clock_minutes
+from family_safety_bot.config import (
+    WEEKDAY_SUFFIXES,
+    BankProfile,
+    RuleProfile,
+    Settings,
+    parse_clock_minutes,
+)
 from family_safety_bot.formatting import format_duration
 from family_safety_bot.i18n import I18n
 from family_safety_bot.storage import ActiveSession, PlaytimeStore
@@ -95,6 +101,37 @@ class PlaytimeRules:
     def _initial_balance(self, bank: BankProfile) -> int:
         return bank.max_balance_minutes if bank.is_recovery else 0
 
+    @staticmethod
+    def _matching_day_banks(profile: RuleProfile, weekday: int) -> dict[str, BankProfile]:
+        return {
+            key: bank
+            for key, bank in profile.banks.items()
+            if bank.is_day_bank and weekday in (bank.days or ())
+        }
+
+    def _untapped_day_banks(
+        self,
+        now: datetime,
+        profile: RuleProfile,
+    ) -> dict[str, BankProfile]:
+        local_date = now.date().isoformat()
+        return {
+            key: bank
+            for key, bank in self._matching_day_banks(profile, now.weekday()).items()
+            if not self._store.has_play_day_tap(self._child_id, bank.name, local_date)
+        }
+
+    def _limiting_balances(
+        self,
+        state: RuntimeState,
+        profile: RuleProfile,
+    ) -> dict[str, int]:
+        return {
+            key: balance
+            for key, balance in state.bank_balances.items()
+            if not profile.banks[key].is_day_bank
+        }
+
     def _refresh_runtime(self, now: datetime, profile: RuleProfile) -> tuple[RuntimeState, AutomaticUpdate]:
         active = self._store.get_active_session(self._child_id)
         completed_minutes: int | None = None
@@ -140,6 +177,15 @@ class PlaytimeRules:
         )
 
     def _bank_balance_line(self, bank: BankProfile, balance: int) -> str:
+        if bank.is_day_bank:
+            return self._i18n.msg(
+                "rules.day_bank_balance",
+                bank_name=bank.name,
+                balance=balance,
+                maximum=bank.max_balance_minutes,
+                weekly_addition=bank.weekly_addition_minutes,
+                days=", ".join(WEEKDAY_SUFFIXES[day].lower() for day in bank.days or ()),
+            )
         if bank.is_recovery:
             return self._i18n.msg(
                 "rules.recovery_bank_balance",
@@ -183,6 +229,8 @@ class PlaytimeRules:
         for key, bank in profile.banks.items():
             balance = balances[key]
             lines.append(self._bank_balance_line(bank, balance))
+            if bank.is_day_bank:
+                continue
             if not bank.is_recovery:
                 lines.append(self._bank_pace_line(bank, balance, now, profile))
             elif balance < bank.max_balance_minutes:
@@ -227,6 +275,11 @@ class PlaytimeRules:
                     candidate = int((start_dt - dt).total_seconds() // 60)
                     best = candidate if best is None else min(best, candidate)
         return best
+
+    @staticmethod
+    def _minutes_until_next_day(dt: datetime) -> int:
+        tomorrow = (dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return max(0, int((tomorrow - dt).total_seconds() // 60))
 
     @staticmethod
     def _merged_minutes(ranges: list[tuple[int, int]]) -> int:
@@ -289,9 +342,18 @@ class PlaytimeRules:
     def _max_target_minutes_from_now(
         self,
         state: RuntimeState,
+        profile: RuleProfile,
         minutes_until_blackout: int | None,
+        requested_minutes: int | None = None,
     ) -> int:
-        target = state.active_remaining + max(0, min(state.bank_balances.values(), default=0))
+        balances = self._limiting_balances(state, profile)
+        if balances:
+            target = state.active_remaining + max(0, min(balances.values()))
+        elif requested_minutes is not None:
+            target = requested_minutes
+        else:
+            # Day banks decide whether today may be used, not how many minutes it contains.
+            target = minutes_until_blackout if minutes_until_blackout is not None else 1440
         if minutes_until_blackout is not None:
             target = min(target, minutes_until_blackout)
         return max(0, target)
@@ -303,6 +365,7 @@ class PlaytimeRules:
         state: RuntimeState,
         profile: RuleProfile,
         blackout_capacity: int | None,
+        day_capacity: int | None,
     ) -> str:
         if granted >= requested:
             return ""
@@ -314,6 +377,8 @@ class PlaytimeRules:
             )
         ]
         for key, balance in state.bank_balances.items():
+            if profile.banks[key].is_day_bank:
+                continue
             capacity = state.active_remaining + max(0, balance)
             if requested > capacity:
                 lines.append(
@@ -327,6 +392,10 @@ class PlaytimeRules:
             lines.append(
                 self._i18n.msg("rules.partial_grant_reason_blackout", available=format_duration(blackout_capacity))
             )
+        if day_capacity is not None and requested > day_capacity:
+            lines.append(
+                self._i18n.msg("rules.partial_grant_reason_day_boundary", available=format_duration(day_capacity))
+            )
         return "\n".join(lines)
 
     def evaluate_request(self, requested_minutes: int) -> PlaytimeDecision:
@@ -337,7 +406,16 @@ class PlaytimeRules:
             return PlaytimeDecision(False, reason)
 
         state, _update = self._refresh_runtime(now, profile)
-        empty = [profile.banks[key].name for key, balance in state.bank_balances.items() if balance <= 0]
+        empty = [
+            profile.banks[key].name
+            for key, balance in self._limiting_balances(state, profile).items()
+            if balance <= 0
+        ]
+        empty.extend(
+            bank.name
+            for key, bank in self._untapped_day_banks(now, profile).items()
+            if state.bank_balances[key] <= 0
+        )
         if empty and requested_minutes > state.active_remaining:
             return PlaytimeDecision(
                 False,
@@ -354,9 +432,19 @@ class PlaytimeRules:
             )
 
         blackout_capacity = self._minutes_until_next_blackout(now, profile)
+        day_capacity = (
+            self._minutes_until_next_day(now)
+            if any(bank.is_day_bank for bank in profile.banks.values())
+            else None
+        )
+        schedule_capacity = min(
+            capacity
+            for capacity in (blackout_capacity, day_capacity)
+            if capacity is not None
+        ) if blackout_capacity is not None or day_capacity is not None else None
         granted = min(
             max(0, requested_minutes),
-            self._max_target_minutes_from_now(state, blackout_capacity),
+            self._max_target_minutes_from_now(state, profile, schedule_capacity, requested_minutes),
         )
         if granted <= state.active_remaining:
             return PlaytimeDecision(
@@ -371,7 +459,14 @@ class PlaytimeRules:
             )
         return PlaytimeDecision(
             True,
-            self._partial_grant_reason(requested_minutes, granted, state, profile, blackout_capacity),
+            self._partial_grant_reason(
+                requested_minutes,
+                granted,
+                state,
+                profile,
+                blackout_capacity,
+                day_capacity,
+            ),
             granted,
         )
 
@@ -394,19 +489,26 @@ class PlaytimeRules:
                 self._store.clear_recovery_interruption(self._child_id)
 
         new_balances = {
-            key: balance - additional
-            for key, balance in state.bank_balances.items()
+            key: balance if bank.is_day_bank else balance - additional
+            for key, bank in profile.banks.items()
+            for balance in (state.bank_balances[key],)
         }
         for key, balance in new_balances.items():
-            self._store.set_bank_balance(self._child_id, balance, profile.banks[key].name, now)
+            if not profile.banks[key].is_day_bank:
+                self._store.set_bank_balance(self._child_id, balance, profile.banks[key].name, now)
 
         if state.active_session is None:
             session_id = self._store.add_session(self._child_id, now, minutes)
         else:
             session_id, _start, current_granted = state.active_session
             self._store.set_session_minutes_granted(session_id, current_granted + additional)
-        for bank_name in profile.banks:
-            self._store.add_session_bank_debit(session_id, bank_name, additional)
+        for bank_name, bank in profile.banks.items():
+            if not bank.is_day_bank:
+                self._store.add_session_bank_debit(session_id, bank_name, additional)
+        local_date = now.date().isoformat()
+        for key, bank in self._untapped_day_banks(now, profile).items():
+            if self._store.tap_play_day(self._child_id, bank.name, local_date, session_id):
+                new_balances[key] -= 1
 
         lines = [self._i18n.msg("rules.grant_confirm", minutes=format_duration(minutes))]
         if state.active_session is not None:
@@ -487,7 +589,22 @@ class PlaytimeRules:
         ]
 
         blackout_capacity = self._minutes_until_next_blackout(now, profile)
-        available = self._max_target_minutes_from_now(state, blackout_capacity)
+        day_capacity = (
+            self._minutes_until_next_day(now)
+            if any(bank.is_day_bank for bank in profile.banks.values())
+            else None
+        )
+        schedule_capacity = min(
+            capacity
+            for capacity in (blackout_capacity, day_capacity)
+            if capacity is not None
+        ) if blackout_capacity is not None or day_capacity is not None else None
+        available = self._max_target_minutes_from_now(state, profile, schedule_capacity)
+        if any(
+            state.bank_balances[key] <= 0
+            for key in self._untapped_day_banks(now, profile)
+        ):
+            available = state.active_remaining
         weekday = now.weekday()
         current = now.hour * 60 + now.minute
         upcoming = [
@@ -538,6 +655,14 @@ class PlaytimeRules:
         self._refresh_runtime(now, self._profile())
         actual = self._store.add_to_bank(self._child_id, minutes, bank.max_balance_minutes, bank.name)
         balance = self._store.get_bank_balance(self._child_id, bank.name)
+        if bank.is_day_bank:
+            return self._i18n.msg(
+                "rules.add_to_day_bank",
+                bank_name=bank.name,
+                actual_added=actual,
+                bank=balance,
+                max_bank=bank.max_balance_minutes,
+            )
         return self._i18n.msg(
             "rules.add_to_bank",
             bank_name=bank.name,
@@ -553,6 +678,17 @@ class PlaytimeRules:
         capped = max(0, min(minutes, bank.max_balance_minutes))
         old = self._store.get_bank_balance(self._child_id, bank.name)
         self._store.set_bank_balance(self._child_id, capped, bank.name, self._get_local_now())
+        if bank.is_day_bank:
+            message = self._i18n.msg(
+                "rules.set_day_bank",
+                bank_name=bank.name,
+                old_balance=old,
+                new_balance=capped,
+                max_bank=bank.max_balance_minutes,
+            )
+            if capped != minutes:
+                message += self._i18n.msg("rules.set_bank_capped")
+            return message
         message = self._i18n.msg(
             "rules.set_bank",
             bank_name=bank.name,
@@ -587,11 +723,15 @@ class PlaytimeRules:
             )
             lines.append(
                 self._i18n.msg(
-                    "rules.rollover_bank",
+                    "rules.rollover_day_bank" if bank.is_day_bank else "rules.rollover_bank",
                     bank_name=bank.name,
-                    actual_added=format_duration(actual),
-                    new_bank=format_duration(old + actual),
-                    max_bank=format_duration(bank.max_balance_minutes),
+                    actual_added=actual if bank.is_day_bank else format_duration(actual),
+                    new_bank=old + actual if bank.is_day_bank else format_duration(old + actual),
+                    max_bank=(
+                        bank.max_balance_minutes
+                        if bank.is_day_bank
+                        else format_duration(bank.max_balance_minutes)
+                    ),
                 )
             )
         return "\n".join(lines)
