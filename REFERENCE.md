@@ -9,19 +9,26 @@ The README contains the Docker Compose setup flow, including Signal linking, gro
 - `PHONE_NUMBER` is the linked Signal account used by the bot.
 - `SIGNAL_GROUP_ID` is the one group where the bot listens and posts.
 - `SIGNAL_SERVICE` is the address of `signal-cli-rest-api` from the bot process.
-- `MS_FAMILY_EMAIL` must belong to a Microsoft Family organizer account that can manage the configured children.
-- Microsoft sign-in uses passwordless Authenticator number matching. The first operation posts the verification ID to Signal; approve that prompt to bootstrap the session.
-- The authenticated cookie jar is stored at `DATA_DIR/ms-family-session.json` with owner-only permissions and reused across requests and restarts. A new Authenticator prompt appears only when Microsoft expires the session.
+- Each `ADMIN_n_MS_EMAIL` identifies the Microsoft Family organizer account used for commands from that Signal admin.
+- Microsoft sign-in uses passwordless Authenticator number matching. The first command from a linked admin posts the verification ID to Signal; approve that prompt to bootstrap the session.
+- The shared authenticated cookie jar is stored at `DATA_DIR/ms-family-session.json` with owner-only permissions and reused across requests and restarts. A new Authenticator prompt appears only when Microsoft expires the session.
 
 ### Admins
 
 Admins are configured with contiguous indexed variables starting at 1:
 
 - `ADMIN_1_PHONE`
+- `ADMIN_1_MS_EMAIL`
 - `ADMIN_2_PHONE`
+- `ADMIN_2_MS_EMAIL`
 - `ADMIN_3_PHONE`
+- `ADMIN_3_MS_EMAIL`
 
 Parsing stops at the first missing index. If `ADMIN_2_PHONE` is missing, `ADMIN_3_PHONE` is ignored.
+`ADMIN_n_MS_EMAIL` links that Signal admin to a Microsoft organizer account. At
+least one linked admin is required. Different admins may use different organizer
+accounts. The email is used only when that admin must create or renew the one
+shared authenticated session.
 
 ### Children
 
@@ -73,7 +80,7 @@ Each item in the profile's `blackouts` array has `days`, `start`, and `end`. `da
 
 - `<duration>` - Request playtime, for example `30m`, `30min`, `1.5h`, `1h 30m`, or `3x1h15m`.
 - `<duration> <description>` - Submit an activity claim for admin approval, for example `30m went for a walk`.
-- `status` - Validate the Microsoft Family Safety session, then show status for all children. The authentication check does not grant, block, or change balances.
+- `status` - Show status for all children.
 - `end` - End the child's active session early.
 - `?` - Show child help.
 
@@ -98,6 +105,12 @@ Each item in the profile's `blackouts` array has `days`, `start`, and `end`. `da
 - `profile use <profile> <child>` - Assign a profile to one child.
 
 `<name>` is case-insensitive. For commands that accept `[name]`, omitting it applies the command to all children.
+
+Every recognized command first validates the Microsoft Family Safety session.
+When it has expired, a command sent by a linked admin starts the Authenticator
+flow using that admin's `ADMIN_n_MS_EMAIL` and then continues after approval.
+Unlinked admins and children do not start an authentication challenge; they may
+reuse the shared session while it remains valid.
 
 ### Profile Definition JSON
 

@@ -40,7 +40,7 @@ Replace the phone number with `PHONE_NUMBER` from `.env`. Find the family group 
 
 4. Find each Microsoft child ID:
 
-Sign in at `https://account.microsoft.com/family` with the parent/organizer account used by `MS_FAMILY_EMAIL`. Open browser developer tools, go to the **Network** tab, filter for `roster`, and refresh the Family Safety page. Open the `/family/api/roster` response, find each child in `members`, and copy that member’s `puid` into `CHILD_n_MS_ID`.
+Sign in at `https://account.microsoft.com/family` with one of the organizer accounts configured as `ADMIN_n_MS_EMAIL`. Open browser developer tools, go to the **Network** tab, filter for `roster`, and refresh the Family Safety page. Open the `/family/api/roster` response, find each child in `members`, and copy that member’s `puid` into `CHILD_n_MS_ID`.
 
 5. Finish `.env`:
 
@@ -50,12 +50,11 @@ PHONE_NUMBER=+1234567890
 SIGNAL_GROUP_ID=group.ckRzaEd4VmRzNnJaASA...
 
 ADMIN_1_PHONE=+1234567892
+ADMIN_1_MS_EMAIL=parent@example.com
 
 CHILD_1_PHONE=+1234567891
 CHILD_1_MS_ID=1234567890123456
 CHILD_1_NAME=Alice
-
-MS_FAMILY_EMAIL=parent@example.com
 
 TZ=Europe/Helsinki
 DATA_DIR=./data
@@ -71,15 +70,18 @@ docker compose up -d
 docker compose logs -f playtime-bot
 ```
 
-On the first Microsoft operation, the bot sends the Authenticator number-match
-code to the Signal group. Approve that passwordless sign-in once. The bot stores
-the resulting Microsoft session in `DATA_DIR/ms-family-session.json` with
-owner-only permissions and reuses it across requests and restarts. It asks for a
-new approval only after Microsoft expires the stored session.
+On the first command from a linked admin, the bot sends the Authenticator
+number-match code to the Signal group. Approve that passwordless sign-in once.
+The bot stores the resulting Microsoft session in
+`DATA_DIR/ms-family-session.json` with owner-only permissions and reuses it
+across requests and restarts. It asks for a new approval only after Microsoft
+expires the stored session.
 
-An admin `status` command (`tila` in Finnish) validates this Microsoft session
-before reporting child status. This check does not grant or block time, and is a
-safe way to renew authentication before it is needed for a playtime request.
+Every recognized bot command validates the shared Microsoft organizer session
+before doing its work. If it is missing or stale, an admin command uses that
+sender's `ADMIN_n_MS_EMAIL` to create its replacement. Child commands reuse a
+valid session, but report that linked-admin authentication is required rather
+than starting a challenge.
 
 Then define and assign a profile in Signal. This example recreates a long-term earned-time bank plus a 30-hour weekly allowance:
 

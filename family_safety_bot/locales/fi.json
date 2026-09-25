@@ -29,6 +29,7 @@
     "watcher.ms_authenticator_action_auth": "tarkistetaan Microsoft Family Safety -yhteys",
     "watcher.auth_succeeded": "✅ Microsoft Family Safety -tunnistautuminen toimii.",
     "watcher.auth_failed": "❌ Microsoft Family Safety -tunnistautuminen epäonnistui. Tarkista botin lokit.",
+    "watcher.auth_admin_required": "❌ Microsoft Family Safety -tunnistautuminen on vanhentunut. Pyydä tähän Microsoft-tiliin yhdistettyä ylläpitäjää lähettämään botille komento, jotta hän voi hyväksyä kirjautumisen.",
     "watcher.admin_prefix": "🔧 Ylläpitäjä ({child_name}): {message}",
     "watcher.admin_child_blocked": "🛑 [{child_name}] Myöntämisen estotila kytketty päälle. Peliaikapyynnöt hylätään.",
     "watcher.admin_child_unblocked": "✅ [{child_name}] Myöntämisen estotila poistettu. Peliaikapyyntöjä voidaan taas myöntää.",

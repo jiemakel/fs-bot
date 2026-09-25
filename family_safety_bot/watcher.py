@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 import json
 import logging
 import re
@@ -23,7 +24,7 @@ from family_safety_bot.config import (
 from family_safety_bot.durations import parse_activity_claim, parse_duration_minutes, parse_signed_duration_minutes
 from family_safety_bot.formatting import format_duration
 from family_safety_bot.i18n import I18n
-from family_safety_bot.ms_family import MicrosoftFamilyApi
+from family_safety_bot.ms_family import AuthenticationRequiredError, MicrosoftFamilyApi
 from family_safety_bot.rules import PlaytimeRules
 from family_safety_bot.storage import ActivityClaim, PlaytimeStore
 
@@ -80,6 +81,11 @@ class PlaytimeManager(DataMessageHandler):
             for alias in self._i18n.command_aliases(key)
         }
         self._ms_api: MicrosoftFamilyApi | None = None
+        self._ms_api_email: str | None = None
+        self._command_can_authenticate: ContextVar[bool] = ContextVar(
+            "command_can_authenticate",
+            default=False,
+        )
         self._ms_api_lock = asyncio.Lock()
         self._profiles_by_name: dict[str, RuleProfile] = {}
         self._active_profile_name_by_child: dict[str, str] = {}
@@ -356,7 +362,12 @@ class PlaytimeManager(DataMessageHandler):
             await action(child, rules, minutes, is_relative)
         return True
 
-    async def _handle_admin_command(self, ctx: DataMessageContext, message_text: str) -> bool:
+    async def _handle_admin_command(
+        self,
+        ctx: DataMessageContext,
+        message_text: str,
+        authentication_email: str | None,
+    ) -> bool:
         parts = message_text.split(maxsplit=1)
         if not parts:
             return False
@@ -365,8 +376,14 @@ class PlaytimeManager(DataMessageHandler):
 
         handler = self._admin_handlers.get(command)
         if handler:
+            if not await self._ensure_ms_authentication(ctx, authentication_email):
+                return True
             return await handler(ctx, payload)
 
+        if self._parse_admin_bank_payload(message_text) is None:
+            return False
+        if not await self._ensure_ms_authentication(ctx, authentication_email):
+            return True
         return await self._handle_admin_bank_command(ctx, message_text)
 
     async def _send_admin_result(self, ctx: DataMessageContext, child: Child, message: str) -> None:
@@ -565,8 +582,9 @@ class PlaytimeManager(DataMessageHandler):
         if sender is None:
             logger.info("Ignoring Signal message without a sender")
             return
-        
         is_admin = sender in self._settings.signal_admins
+        authentication_email = self._settings.admin_ms_emails.get(sender) if is_admin else None
+        self._command_can_authenticate.set(authentication_email is not None)
         child = self._settings.children.get(sender)
         child_context = (child, self._rules_by_child[sender]) if child is not None else None
         
@@ -577,6 +595,8 @@ class PlaytimeManager(DataMessageHandler):
         sender_name = child.name if child is not None else "Admin"
         
         if message_lower in self._commands["help"]:
+            if not await self._ensure_ms_authentication(context, authentication_email):
+                return
             await context.send(
                 SendMessage(
                     text=self._i18n.msg("watcher.help_admin" if is_admin else "watcher.help_child")
@@ -585,14 +605,16 @@ class PlaytimeManager(DataMessageHandler):
             return
 
         if message_lower in self._commands["status"]:
-            if is_admin:
-                await self._check_ms_authentication(context)
+            if not await self._ensure_ms_authentication(context, authentication_email):
+                return
             for phone, child_obj in self._settings.children.items():
                 await context.send(SendMessage(text=self._format_child_status_section(phone, child_obj)))
             return
 
         parsed_minutes = parse_duration_minutes(message_text)
         if parsed_minutes is not None and child_context is not None:
+            if not await self._ensure_ms_authentication(context, authentication_email):
+                return
             child, rules = child_context
             await self.request_command(context, child, rules, parsed_minutes, sender_name)
             return
@@ -601,10 +623,14 @@ class PlaytimeManager(DataMessageHandler):
             child, rules = child_context
             claim_minutes = parse_activity_claim(message_text)
             if claim_minutes is not None:
+                if not await self._ensure_ms_authentication(context, authentication_email):
+                    return
                 await self.claim_command(context, child, claim_minutes, message_text, sender_name)
                 return
 
         if child_context is not None and NUMERIC_ONLY_RE.match(message_text):
+            if not await self._ensure_ms_authentication(context, authentication_email):
+                return
             await context.send(
                 SendMessage(
                     text=self._i18n.msg("watcher.numeric_unit_required", sender_name=sender_name)
@@ -613,11 +639,17 @@ class PlaytimeManager(DataMessageHandler):
             return
 
         if message_lower in self._commands["end"] and child_context is not None:
+            if not await self._ensure_ms_authentication(context, authentication_email):
+                return
             child, rules = child_context
             await self.end_session_command(context, child, rules, sender_name)
             return
 
-        if is_admin and await self._handle_admin_command(context, message_text):
+        if is_admin and await self._handle_admin_command(
+            context,
+            message_text,
+            authentication_email=authentication_email,
+        ):
             return
         
         if self._should_send_implicit_help(context, message_text):
@@ -634,13 +666,9 @@ class PlaytimeManager(DataMessageHandler):
         mfa_challenge_handler: Callable[[str, int], Awaitable[None]] | None = None,
     ) -> bool:
         async with self._ms_api_lock:
-            if self._ms_api is None:
-                self._ms_api = MicrosoftFamilyApi(
-                    self._settings.ms_family_email,
-                    session_path=Path(self._settings.data_dir) / "ms-family-session.json",
-                )
             api = self._ms_api
-            await api.ensure_authenticated(mfa_challenge_handler=mfa_challenge_handler)
+            if api is None:
+                raise RuntimeError("No authenticated Microsoft account selected for command")
             if await action(api):
                 return True
             if api.last_status_code != 401:
@@ -652,8 +680,22 @@ class PlaytimeManager(DataMessageHandler):
             await api.ensure_authenticated(force=True, mfa_challenge_handler=mfa_challenge_handler)
             return await action(api)
 
-    async def _check_ms_authentication(self, ctx: DataMessageContext) -> None:
+    def _create_ms_api(self, email: str) -> MicrosoftFamilyApi:
+        return MicrosoftFamilyApi(
+            email,
+            session_path=Path(self._settings.data_dir) / "ms-family-session.json",
+        )
+
+    async def _ensure_ms_authentication(
+        self,
+        ctx: DataMessageContext,
+        authentication_email: str | None,
+    ) -> bool:
+        challenge_announced = False
+
         async def announce_mfa(display_id: str, timeout_seconds: int) -> None:
+            nonlocal challenge_announced
+            challenge_announced = True
             await ctx.send(SendMessage(text=self._i18n.msg(
                 "watcher.ms_authenticator_challenge",
                 action=self._i18n.msg("watcher.ms_authenticator_action_auth"),
@@ -661,21 +703,34 @@ class PlaytimeManager(DataMessageHandler):
                 timeout_seconds=timeout_seconds,
             )))
 
-        async def authentication_only(_api: MicrosoftFamilyApi) -> bool:
-            return True
-
+        initial_email = authentication_email or next(iter(self._settings.admin_ms_emails.values()))
         try:
-            await self._call_ms_api_with_retry(
-                "authentication check",
-                authentication_only,
-                announce_mfa,
-            )
+            async with self._ms_api_lock:
+                if self._ms_api is None:
+                    self._ms_api = self._create_ms_api(initial_email)
+                    self._ms_api_email = initial_email
+
+                if await self._ms_api.has_valid_session():
+                    return True
+
+                if authentication_email is None:
+                    await ctx.send(SendMessage(text=self._i18n.msg("watcher.auth_admin_required")))
+                    return False
+
+                if (self._ms_api_email or "").casefold() != authentication_email.casefold():
+                    await self._ms_api.aclose()
+                    self._ms_api = self._create_ms_api(authentication_email)
+                    self._ms_api_email = authentication_email
+                await self._ms_api.ensure_authenticated(mfa_challenge_handler=announce_mfa)
         except (ValueError, RuntimeError, httpx.HTTPError) as exc:
             logger.error("Microsoft authentication check failed: %s", exc)
-            await ctx.send(SendMessage(text=self._i18n.msg("watcher.auth_failed")))
-            return
+            message_key = "watcher.auth_failed" if authentication_email else "watcher.auth_admin_required"
+            await ctx.send(SendMessage(text=self._i18n.msg(message_key)))
+            return False
 
-        await ctx.send(SendMessage(text=self._i18n.msg("watcher.auth_succeeded")))
+        if challenge_announced:
+            await ctx.send(SendMessage(text=self._i18n.msg("watcher.auth_succeeded")))
+        return True
 
     async def _grant_via_ms_api(
         self,
@@ -721,7 +776,13 @@ class PlaytimeManager(DataMessageHandler):
                 timeout_seconds=timeout_seconds,
             )))
         try:
-            block_success = await self._block_via_ms_api(child.ms_account_id, announce_mfa)
+            block_success = await self._block_via_ms_api(
+                child.ms_account_id,
+                announce_mfa if self._command_can_authenticate.get() else None,
+            )
+        except AuthenticationRequiredError:
+            await ctx.send(SendMessage(text=prefix + self._i18n.msg("watcher.auth_admin_required")))
+            return None
         except (ValueError, RuntimeError, httpx.HTTPError) as exc:
             logger.error("Failed to block time via Microsoft API: %s", exc)
             await ctx.send(SendMessage(text=prefix + error_message))
@@ -784,8 +845,15 @@ class PlaytimeManager(DataMessageHandler):
             grant_success = await self._grant_via_ms_api(
                 child.ms_account_id,
                 decision.minutes_granted,
-                announce_mfa,
+                announce_mfa if self._command_can_authenticate.get() else None,
             )
+        except AuthenticationRequiredError:
+            await self._send_with_pending_claims(
+                ctx,
+                child,
+                self._i18n.msg("watcher.auth_admin_required"),
+            )
+            return
         except (ValueError, RuntimeError, httpx.HTTPError) as exc:
             logger.error("Failed to grant time via Microsoft API: %s", exc)
             await self._send_with_pending_claims(ctx, child, self._i18n.msg("watcher.request_grant_error", sender_name=sender_name))

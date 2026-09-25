@@ -60,6 +60,14 @@ class FakeBot:
         self.sent.append((receiver, message.text or ""))
 
 
+class AuthenticatedMicrosoftFamilyApi:
+    async def has_valid_session(self) -> bool:
+        return True
+
+    async def ensure_authenticated(self, **_kwargs: Any) -> None:
+        pass
+
+
 def _build_manager(tmp_path: Path, **settings_overrides: Any) -> tuple[PlaytimeManager, PlaytimeStore]:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path, **settings_overrides)
@@ -69,6 +77,8 @@ def _build_manager(tmp_path: Path, **settings_overrides: Any) -> tuple[PlaytimeM
             store.set_active_rule_profile_name_for_child(child_phone, settings.default_rule_profile.name)
     manager = PlaytimeManager(settings, store)
     manager.bot = cast(SignalBot, FakeBot(sent=[]))
+    manager._ms_api = cast(MicrosoftFamilyApi, AuthenticatedMicrosoftFamilyApi())
+    manager._ms_api_email = "test@example.com"
     return manager, store
 
 
@@ -113,31 +123,103 @@ def test_playtime_manager_parses_day_bank_admin_amount(tmp_path: Path) -> None:
     assert is_relative is False
 
 
-def test_playtime_manager_status_sends_one_message_per_child(tmp_path: Path) -> None:
+def test_admin_status_authenticates_with_initiating_admin_account_and_lists_children(
+    tmp_path: Path,
+) -> None:
     second_phone = "+1234567892"
+    second_admin = "+1234567893"
     children = {
         CHILD_PHONE: Child(CHILD_PHONE, "child123", "TestChild"),
         second_phone: Child(second_phone, "child456", "SecondChild"),
     }
-    manager, _store = _build_manager(tmp_path, children=children)
+    manager, _store = _build_manager(
+        tmp_path,
+        children=children,
+        signal_admins=[ADMIN_PHONE, second_admin],
+        admin_ms_emails={
+            ADMIN_PHONE: "first@example.com",
+            second_admin: "second@example.com",
+        },
+    )
     authentication_checks = 0
 
     class FakeMicrosoftFamilyApi:
+        async def has_valid_session(self) -> bool:
+            return False
+
         async def ensure_authenticated(self, **kwargs: Any) -> None:
             nonlocal authentication_checks
             authentication_checks += 1
             challenge_handler = kwargs["mfa_challenge_handler"]
             await challenge_handler("STATUS42", 60)
 
-    manager._ms_api = cast(MicrosoftFamilyApi, FakeMicrosoftFamilyApi())
+    created_for: list[str] = []
 
-    ctx = FakeContext(message_text="status", sender=ADMIN_PHONE, sent_messages=[])
+    def create_ms_api(email: str) -> MicrosoftFamilyApi:
+        created_for.append(email)
+        return cast(MicrosoftFamilyApi, FakeMicrosoftFamilyApi())
+
+    manager._ms_api = None
+    manager._ms_api_email = None
+    manager._create_ms_api = create_ms_api  # type: ignore[method-assign]
+
+    ctx = FakeContext(message_text="status", sender=second_admin, sent_messages=[])
     _run_handle(manager, ctx)
 
     assert authentication_checks == 1
+    assert created_for == ["second@example.com"]
     assert "STATUS42" in ctx.sent_messages[0]
     assert "authentication is working" in ctx.sent_messages[1]
     assert len(ctx.sent_messages) == len(children) + 2
+
+
+def test_admin_status_reuses_valid_shared_session_from_another_admin(tmp_path: Path) -> None:
+    second_admin = "+1234567893"
+    manager, _store = _build_manager(
+        tmp_path,
+        signal_admins=[ADMIN_PHONE, second_admin],
+        admin_ms_emails={
+            ADMIN_PHONE: "first@example.com",
+            second_admin: "second@example.com",
+        },
+    )
+
+    def unexpected_new_client(_email: str) -> MicrosoftFamilyApi:
+        raise AssertionError("A valid shared session must be reused")
+
+    manager._ms_api_email = "first@example.com"
+    manager._create_ms_api = unexpected_new_client  # type: ignore[method-assign]
+    ctx = FakeContext(message_text="status", sender=second_admin, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert len(ctx.sent_messages) == 1
+    assert "[TestChild]" in ctx.sent_messages[0]
+
+
+def test_child_command_reports_stale_authentication_without_starting_challenge(
+    tmp_path: Path,
+) -> None:
+    manager, _store = _build_manager(tmp_path)
+    interactive_auth_attempted = False
+
+    class StaleMicrosoftFamilyApi:
+        async def has_valid_session(self) -> bool:
+            return False
+
+        async def ensure_authenticated(self, **kwargs: Any) -> None:
+            nonlocal interactive_auth_attempted
+            interactive_auth_attempted = kwargs["mfa_challenge_handler"] is not None
+            raise ValueError("Authenticator approval required")
+
+    manager._ms_api = cast(MicrosoftFamilyApi, StaleMicrosoftFamilyApi())
+    manager._ms_api_email = "test@example.com"
+    ctx = FakeContext(message_text="status", sender=CHILD_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert interactive_auth_attempted is False
+    assert len(ctx.sent_messages) == 1
+    assert "Ask an admin" in ctx.sent_messages[0]
+    assert "[TestChild]" not in ctx.sent_messages[0]
 
 
 def test_playtime_manager_status_includes_pending_activity_claims(tmp_path: Path) -> None:
@@ -220,7 +302,7 @@ def test_playtime_request_without_pending_claims_omits_overview(tmp_path: Path) 
     assert store.get_active_session(CHILD_PHONE) is not None
 
 
-def test_playtime_request_announces_authenticator_challenge_details(tmp_path: Path) -> None:
+def test_admin_playtime_request_announces_authenticator_challenge_details(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
     store.set_bank_balance(CHILD_PHONE, 120)
 
@@ -230,7 +312,11 @@ def test_playtime_request_announces_authenticator_challenge_details(tmp_path: Pa
         return True
 
     manager._grant_via_ms_api = fake_grant  # type: ignore[method-assign]
-    ctx = FakeContext(message_text="30m", sender=CHILD_PHONE, sent_messages=[])
+    ctx = FakeContext(
+        message_text="request TestChild 30m",
+        sender=ADMIN_PHONE,
+        sent_messages=[],
+    )
     _run_handle(manager, ctx)
 
     assert len(ctx.sent_messages) == 2

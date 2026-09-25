@@ -216,7 +216,7 @@ def parse_rule_profile_definition(name: str, definition: Any) -> RuleProfile:
 @dataclass(frozen=True)
 class Settings:
     # Microsoft Family Safety identity
-    ms_family_email: str
+    admin_ms_emails: dict[str, str]  # Signal admin phone -> Microsoft organizer email
     
     # Signal configuration
     children: dict[str, Child]  # Keyed by phone_number for fast lookup
@@ -229,13 +229,16 @@ class Settings:
     bot_language: str = "en"
 
     @staticmethod
-    def _parse_admins_from_env() -> list[str]:
+    def _parse_admins_from_env() -> tuple[list[str], dict[str, str]]:
         admins: list[str] = []
+        admin_ms_emails: dict[str, str] = {}
         admin_index = 1
         while phone := os.environ.get(f"ADMIN_{admin_index}_PHONE"):
             admins.append(phone)
+            if email := os.environ.get(f"ADMIN_{admin_index}_MS_EMAIL", "").strip():
+                admin_ms_emails[phone] = email
             admin_index += 1
-        return admins
+        return admins, admin_ms_emails
 
     @staticmethod
     def _parse_children_from_env() -> dict[str, Child]:
@@ -257,18 +260,20 @@ class Settings:
     def from_env() -> "Settings":
         env = os.environ
         children = Settings._parse_children_from_env()
-        signal_admins = Settings._parse_admins_from_env()
+        signal_admins, admin_ms_emails = Settings._parse_admins_from_env()
         signal_group_id = env.get("SIGNAL_GROUP_ID", "")
 
         if not signal_group_id:
             raise ValueError("Missing required SIGNAL_GROUP_ID")
         if not signal_admins:
             raise ValueError("At least one ADMIN_n_PHONE is required")
+        if not admin_ms_emails:
+            raise ValueError("At least one ADMIN_n_MS_EMAIL is required")
         if not children:
             raise ValueError("At least one child is required")
 
         return Settings(
-            ms_family_email=env.get("MS_FAMILY_EMAIL", ""),
+            admin_ms_emails=admin_ms_emails,
             children=children,
             signal_admins=signal_admins,
             signal_group_id=signal_group_id,

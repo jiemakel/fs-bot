@@ -29,12 +29,12 @@ def _require_live_ms_family_env() -> tuple[str, str]:
     if os.environ.get("LIVE_TEST") != "1":
         pytest.skip("Set LIVE_TEST=1 to run Microsoft Family Safety live tests")
 
-    email = os.environ.get("MS_FAMILY_EMAIL", "").strip()
+    email = os.environ.get("ADMIN_1_MS_EMAIL", "").strip()
     child_id = _configured_child_id()
     missing = [
         key
         for key, value in (
-            ("MS_FAMILY_EMAIL", email),
+            ("ADMIN_1_MS_EMAIL", email),
             ("LIVE_MS_FAMILY_CHILD_ID or CHILD_1_MS_ID", child_id),
         )
         if not value

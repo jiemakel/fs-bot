@@ -8,7 +8,11 @@ _OPTIONAL_SETTINGS_ENV_KEYS = (
     "BOT_LANGUAGE",
     "TZ",
     "DATA_DIR",
-    *[f"ADMIN_{index}_PHONE" for index in range(1, 12)],
+    *[
+        f"ADMIN_{index}_{suffix}"
+        for index in range(1, 12)
+        for suffix in ("PHONE", "MS_EMAIL")
+    ],
     *[
         f"CHILD_{index}_{suffix}"
         for index in range(1, 12)
@@ -24,9 +28,9 @@ def _clear_settings_env(monkeypatch) -> None:
 
 
 def _set_minimal_env(monkeypatch) -> None:
-    monkeypatch.setenv("MS_FAMILY_EMAIL", "parent@example.com")
     monkeypatch.setenv("SIGNAL_GROUP_ID", "group.test")
     monkeypatch.setenv("ADMIN_1_PHONE", "+10000000001")
+    monkeypatch.setenv("ADMIN_1_MS_EMAIL", "parent@example.com")
     monkeypatch.setenv("CHILD_1_PHONE", "+10000000002")
     monkeypatch.setenv("CHILD_1_MS_ID", "child1")
     monkeypatch.setenv("CHILD_1_NAME", "Child1")
@@ -151,11 +155,19 @@ def test_settings_parses_bot_language(monkeypatch) -> None:
     assert settings.bot_language == "fi"
 
 
+def test_settings_requires_an_admin_microsoft_email(monkeypatch) -> None:
+    _set_minimal_env(monkeypatch)
+    monkeypatch.delenv("ADMIN_1_MS_EMAIL")
+
+    with pytest.raises(ValueError, match="ADMIN_n_MS_EMAIL"):
+        Settings.from_env()
+
+
 def test_settings_parses_more_than_nine_contiguous_admins_and_children(monkeypatch) -> None:
-    monkeypatch.setenv("MS_FAMILY_EMAIL", "parent@example.com")
     monkeypatch.setenv("SIGNAL_GROUP_ID", "group.test")
     for index in range(1, 11):
         monkeypatch.setenv(f"ADMIN_{index}_PHONE", f"+100000000{index:02d}")
+        monkeypatch.setenv(f"ADMIN_{index}_MS_EMAIL", f"organizer{index}@example.com")
         monkeypatch.setenv(f"CHILD_{index}_PHONE", f"+200000000{index:02d}")
         monkeypatch.setenv(f"CHILD_{index}_MS_ID", f"child{index}")
         monkeypatch.setenv(f"CHILD_{index}_NAME", f"Child{index}")
@@ -163,4 +175,5 @@ def test_settings_parses_more_than_nine_contiguous_admins_and_children(monkeypat
     settings = Settings.from_env()
 
     assert settings.signal_admins[-1] == "+10000000010"
+    assert settings.admin_ms_emails["+10000000010"] == "organizer10@example.com"
     assert settings.children["+20000000010"].name == "Child10"

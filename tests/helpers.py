@@ -43,7 +43,7 @@ def build_settings(tmp_path: Path, **overrides: Any) -> FixtureSettings:
         blackout_periods=[],
     )
     values = {
-        "ms_family_email": "test@example.com",
+        "admin_ms_emails": {ADMIN_PHONE: "test@example.com"},
         "children": {CHILD_PHONE: CHILD},
         "signal_admins": [ADMIN_PHONE],
         "signal_group_id": "test_group",

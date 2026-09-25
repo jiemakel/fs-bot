@@ -29,6 +29,7 @@
     "watcher.ms_authenticator_action_auth": "checking the Microsoft Family Safety connection",
     "watcher.auth_succeeded": "✅ Microsoft Family Safety authentication is working.",
     "watcher.auth_failed": "❌ Microsoft Family Safety authentication failed. Check the bot logs.",
+    "watcher.auth_admin_required": "❌ Microsoft Family Safety authentication has expired. Ask an admin linked to this Microsoft account to send a bot command so they can approve sign-in.",
     "watcher.admin_prefix": "🔧 Admin ({child_name}): {message}",
     "watcher.admin_child_blocked": "🛑 [{child_name}] Grant block mode enabled. Playtime requests will be denied.",
     "watcher.admin_child_unblocked": "✅ [{child_name}] Grant block mode disabled. Playtime requests can be granted again.",

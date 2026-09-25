@@ -18,6 +18,10 @@ from family_safety_bot.formatting import format_duration
 logger = logging.getLogger(__name__)
 MfaChallengeHandler = Callable[[str, int], Awaitable[None]]
 
+
+class AuthenticationRequiredError(RuntimeError):
+    """Raised when interactive authentication is needed but not authorized."""
+
 _FAMILY_URL = "https://account.microsoft.com/family/home"
 _SCREEN_TIME_ENDPOINT = "https://account.microsoft.com/family/api/screen-time-request"
 _ROSTER_ENDPOINT = "https://account.microsoft.com/family/api/roster"
@@ -72,16 +76,33 @@ class MicrosoftFamilyApi:
         if force:
             await self.aclose()
             self._discard_session_file()
-
-        if self._client and self._authenticated:
-            check = await self._client.get(_FAMILY_URL)
-            if self._is_authenticated_family_response(check):
-                return
-            logger.info("Existing Family Safety session appears expired; re-authenticating.")
-            await self.aclose()
-            self._discard_session_file()
+        elif await self.has_valid_session():
+            return
 
         await self._authenticate_web(mfa_challenge_handler)
+
+    async def has_valid_session(self) -> bool:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                headers=_WEB_HEADERS,
+                timeout=httpx.Timeout(30.0),
+                follow_redirects=True,
+            )
+
+        client = self._require_client()
+        if not self._authenticated and not self._load_session_cookies():
+            return False
+
+        check = await client.get(_FAMILY_URL)
+        if self._is_authenticated_family_response(check):
+            self._authenticated = True
+            return True
+
+        logger.info("Existing Family Safety session appears expired")
+        self._authenticated = False
+        client.cookies.clear()
+        self._discard_session_file()
+        return False
 
     def _require_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -136,7 +157,7 @@ class MicrosoftFamilyApi:
             raise ValueError("Could not find PPFT token on login page")
 
         if mfa_challenge_handler is None:
-            raise ValueError(
+            raise AuthenticationRequiredError(
                 "Microsoft Authenticator approval is required, but no challenge handler "
                 "was provided"
             )
