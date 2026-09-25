@@ -22,5 +22,6 @@ wheels/
 data/*.sqlite3
 data/*.sqlite3-*
 data/signal-cli/
+data/ms-family-session.json
 .env
 *.tar

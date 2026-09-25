@@ -6,9 +6,11 @@ import logging
 import re
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Awaitable, Callable
 
 import httpx
+from dateutil import tz
 from signalbot import DataMessageContext, DataMessageHandler, SendMessage, SignalBot
 
 from family_safety_bot.config import (
@@ -56,6 +58,7 @@ class PlaytimeManager(DataMessageHandler):
     def __init__(self, settings: Settings, store: PlaytimeStore) -> None:
         self._settings = settings
         self._store = store
+        self._tz = tz.gettz(settings.timezone)
         self._i18n = I18n(settings.bot_language)
         self._commands = {
             key: set(self._i18n.command_aliases(key))
@@ -559,6 +562,9 @@ class PlaytimeManager(DataMessageHandler):
             return
         message_lower = message_text.lower()
         sender = context.message.source_number or context.message.source
+        if sender is None:
+            logger.info("Ignoring Signal message without a sender")
+            return
         
         is_admin = sender in self._settings.signal_admins
         child = self._settings.children.get(sender)
@@ -579,6 +585,8 @@ class PlaytimeManager(DataMessageHandler):
             return
 
         if message_lower in self._commands["status"]:
+            if is_admin:
+                await self._check_ms_authentication(context)
             for phone, child_obj in self._settings.children.items():
                 await context.send(SendMessage(text=self._format_child_status_section(phone, child_obj)))
             return
@@ -623,15 +631,16 @@ class PlaytimeManager(DataMessageHandler):
         self,
         action_name: str,
         action: Callable[[MicrosoftFamilyApi], Awaitable[bool]],
+        mfa_challenge_handler: Callable[[str, int], Awaitable[None]] | None = None,
     ) -> bool:
         async with self._ms_api_lock:
             if self._ms_api is None:
                 self._ms_api = MicrosoftFamilyApi(
                     self._settings.ms_family_email,
-                    self._settings.ms_family_password,
+                    session_path=Path(self._settings.data_dir) / "ms-family-session.json",
                 )
             api = self._ms_api
-            await api.ensure_authenticated()
+            await api.ensure_authenticated(mfa_challenge_handler=mfa_challenge_handler)
             if await action(api):
                 return True
             if api.last_status_code != 401:
@@ -640,19 +649,55 @@ class PlaytimeManager(DataMessageHandler):
                 "Microsoft %s API returned 401; retrying once with forced re-authentication.",
                 action_name,
             )
-            await api.ensure_authenticated(force=True)
+            await api.ensure_authenticated(force=True, mfa_challenge_handler=mfa_challenge_handler)
             return await action(api)
 
-    async def _grant_via_ms_api(self, child_id: str, minutes: int) -> bool:
+    async def _check_ms_authentication(self, ctx: DataMessageContext) -> None:
+        async def announce_mfa(display_id: str, timeout_seconds: int) -> None:
+            await ctx.send(SendMessage(text=self._i18n.msg(
+                "watcher.ms_authenticator_challenge",
+                action=self._i18n.msg("watcher.ms_authenticator_action_auth"),
+                display_id=display_id,
+                timeout_seconds=timeout_seconds,
+            )))
+
+        async def authentication_only(_api: MicrosoftFamilyApi) -> bool:
+            return True
+
+        try:
+            await self._call_ms_api_with_retry(
+                "authentication check",
+                authentication_only,
+                announce_mfa,
+            )
+        except (ValueError, RuntimeError, httpx.HTTPError) as exc:
+            logger.error("Microsoft authentication check failed: %s", exc)
+            await ctx.send(SendMessage(text=self._i18n.msg("watcher.auth_failed")))
+            return
+
+        await ctx.send(SendMessage(text=self._i18n.msg("watcher.auth_succeeded")))
+
+    async def _grant_via_ms_api(
+        self,
+        child_id: str,
+        minutes: int,
+        mfa_challenge_handler: Callable[[str, int], Awaitable[None]] | None = None,
+    ) -> bool:
         return await self._call_ms_api_with_retry(
             "grant",
             lambda api: api.grant_screen_time(child_id, minutes),
+            mfa_challenge_handler,
         )
 
-    async def _block_via_ms_api(self, child_id: str) -> bool:
+    async def _block_via_ms_api(
+        self,
+        child_id: str,
+        mfa_challenge_handler: Callable[[str, int], Awaitable[None]] | None = None,
+    ) -> bool:
         return await self._call_ms_api_with_retry(
             "block",
             lambda api: api.block_screen_time(child_id),
+            mfa_challenge_handler,
         )
 
     async def _complete_session_after_block(
@@ -668,10 +713,17 @@ class PlaytimeManager(DataMessageHandler):
         """Block an active session before completing it; return None if block failed."""
         if not rules.has_active_session():
             return rules.complete_session() if complete_if_inactive else ""
+        async def announce_mfa(display_id: str, timeout_seconds: int) -> None:
+            await ctx.send(SendMessage(text=self._i18n.msg(
+                "watcher.ms_authenticator_challenge",
+                action=self._i18n.msg("watcher.ms_authenticator_action_block", child_name=child.name),
+                display_id=display_id,
+                timeout_seconds=timeout_seconds,
+            )))
         try:
-            block_success = await self._block_via_ms_api(child.ms_account_id)
-        except (ValueError, RuntimeError, httpx.HTTPError):
-            logger.exception("Failed to block time via Microsoft API")
+            block_success = await self._block_via_ms_api(child.ms_account_id, announce_mfa)
+        except (ValueError, RuntimeError, httpx.HTTPError) as exc:
+            logger.error("Failed to block time via Microsoft API: %s", exc)
             await ctx.send(SendMessage(text=prefix + error_message))
             return None
         if not block_success:
@@ -689,42 +741,57 @@ class PlaytimeManager(DataMessageHandler):
     ) -> None:
         """Handle a playtime request from child."""
         if minutes <= 0:
-            await ctx.send(SendMessage(text=self._i18n.msg("watcher.positive_duration_required", sender_name=sender_name)))
+            await self._send_with_pending_claims(ctx, child, self._i18n.msg("watcher.positive_duration_required", sender_name=sender_name))
             return
 
         if not self._has_profile(child.phone_number):
-            await ctx.send(
-                SendMessage(text=self._i18n.msg(
+            await self._send_with_pending_claims(
+                ctx, child, self._i18n.msg(
                     "watcher.request_denied",
                     sender_name=sender_name,
                     reason=self._i18n.msg("watcher.profile_not_assigned"),
-                ))
+                )
             )
             return
 
         if self._store.is_child_block_mode_enabled(child.phone_number):
-            await ctx.send(
-                SendMessage(text=self._i18n.msg(
+            await self._send_with_pending_claims(
+                ctx, child, self._i18n.msg(
                     "watcher.request_denied",
                     sender_name=sender_name,
                     reason=self._i18n.msg("watcher.request_blocked_by_admin"),
-                ))
+                )
             )
             return
 
         decision = rules.evaluate_request(minutes)
         if not decision.allowed:
-            await ctx.send(SendMessage(text=self._i18n.msg("watcher.request_denied", sender_name=sender_name, reason=decision.reason)))
+            await self._send_with_pending_claims(ctx, child, self._i18n.msg("watcher.request_denied", sender_name=sender_name, reason=decision.reason))
             return
 
+        async def announce_mfa(display_id: str, timeout_seconds: int) -> None:
+            await ctx.send(SendMessage(text=self._i18n.msg(
+                "watcher.ms_authenticator_challenge",
+                action=self._i18n.msg(
+                    "watcher.ms_authenticator_action_grant",
+                    child_name=child.name,
+                    minutes=format_duration(decision.minutes_granted),
+                ),
+                display_id=display_id,
+                timeout_seconds=timeout_seconds,
+            )))
         try:
-            grant_success = await self._grant_via_ms_api(child.ms_account_id, decision.minutes_granted)
-        except (ValueError, RuntimeError, httpx.HTTPError):
-            logger.exception("Failed to grant time via Microsoft API")
-            await ctx.send(SendMessage(text=self._i18n.msg("watcher.request_grant_error", sender_name=sender_name)))
+            grant_success = await self._grant_via_ms_api(
+                child.ms_account_id,
+                decision.minutes_granted,
+                announce_mfa,
+            )
+        except (ValueError, RuntimeError, httpx.HTTPError) as exc:
+            logger.error("Failed to grant time via Microsoft API: %s", exc)
+            await self._send_with_pending_claims(ctx, child, self._i18n.msg("watcher.request_grant_error", sender_name=sender_name))
             return
         if not grant_success:
-            await ctx.send(SendMessage(text=self._i18n.msg("watcher.request_grant_failed", sender_name=sender_name)))
+            await self._send_with_pending_claims(ctx, child, self._i18n.msg("watcher.request_grant_failed", sender_name=sender_name))
             return
 
         _, message = rules.grant_playtime(decision.minutes_granted)
@@ -732,7 +799,7 @@ class PlaytimeManager(DataMessageHandler):
         if decision.reason:
             response += f"\n{decision.reason}"
         response += f"\n{message}"
-        await ctx.send(SendMessage(text=response))
+        await self._send_with_pending_claims(ctx, child, response)
 
     async def admin_block_child_command(self, ctx: DataMessageContext, child: Child, rules: PlaytimeRules) -> None:
         """Enable grant block mode for a child and end any active session."""
@@ -852,14 +919,19 @@ class PlaytimeManager(DataMessageHandler):
         self._store.add_activity_claim(
             child.phone_number, minutes, description, datetime.now(timezone.utc)
         )
-        await ctx.send(
-            SendMessage(text=self._i18n.msg(
+        await self._send_with_pending_claims(
+            ctx, child, self._i18n.msg(
                 "watcher.claim_received",
                 sender_name=sender_name,
                 minutes=format_duration(minutes),
                 description=description,
-            ))
+            )
         )
+
+    async def _send_with_pending_claims(self, ctx: DataMessageContext, child: Child, message: str) -> None:
+        if claims := self._store.get_pending_claims(child.phone_number):
+            message += "\n" + self._format_claims_response(child, claims)
+        await ctx.send(SendMessage(text=message))
 
     def _format_claims_block(self, claims: list[ActivityClaim]) -> str:
         """Format claim entries + total as a multi-line string (no header)."""
@@ -870,7 +942,7 @@ class PlaytimeManager(DataMessageHandler):
                     self._i18n.msg(
                         "watcher.claims_entry",
                         description=c.description,
-                        submitted_at=c.submitted_at.strftime("%Y-%m-%d %H:%M"),
+                        submitted_at=c.submitted_at.astimezone(self._tz).strftime("%Y-%m-%d %H:%M"),
                     )
                     for c in claims
                 ),

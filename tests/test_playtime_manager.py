@@ -10,6 +10,7 @@ import pytest
 from signalbot import SendMessage, SignalBot
 
 from family_safety_bot.config import BankProfile, Child
+from family_safety_bot.ms_family import MicrosoftFamilyApi
 from family_safety_bot.storage import PlaytimeStore
 from family_safety_bot.watcher import PlaytimeManager
 from tests.helpers import ADMIN_PHONE, CHILD_PHONE, build_settings, build_store
@@ -119,11 +120,24 @@ def test_playtime_manager_status_sends_one_message_per_child(tmp_path: Path) -> 
         second_phone: Child(second_phone, "child456", "SecondChild"),
     }
     manager, _store = _build_manager(tmp_path, children=children)
+    authentication_checks = 0
+
+    class FakeMicrosoftFamilyApi:
+        async def ensure_authenticated(self, **kwargs: Any) -> None:
+            nonlocal authentication_checks
+            authentication_checks += 1
+            challenge_handler = kwargs["mfa_challenge_handler"]
+            await challenge_handler("STATUS42", 60)
+
+    manager._ms_api = cast(MicrosoftFamilyApi, FakeMicrosoftFamilyApi())
 
     ctx = FakeContext(message_text="status", sender=ADMIN_PHONE, sent_messages=[])
     _run_handle(manager, ctx)
 
-    assert len(ctx.sent_messages) == len(children)
+    assert authentication_checks == 1
+    assert "STATUS42" in ctx.sent_messages[0]
+    assert "authentication is working" in ctx.sent_messages[1]
+    assert len(ctx.sent_messages) == len(children) + 2
 
 
 def test_playtime_manager_status_includes_pending_activity_claims(tmp_path: Path) -> None:
@@ -135,6 +149,10 @@ def test_playtime_manager_status_includes_pending_activity_claims(tmp_path: Path
     _run_handle(manager, ctx)
 
     assert len(ctx.sent_messages) == 1
+    assert "Pending claims for TestChild (2):" in ctx.sent_messages[0]
+    assert "30m played guitar" in ctx.sent_messages[0]
+    assert "1h cleaned room" in ctx.sent_messages[0]
+    assert "Total: 1h 30m" in ctx.sent_messages[0]
 
 
 def test_playtime_manager_child_request_validation(tmp_path: Path) -> None:
@@ -147,6 +165,79 @@ def test_playtime_manager_child_request_validation(tmp_path: Path) -> None:
     assert len(ctx.sent_messages) == 1
     assert store.get_bank_balance(CHILD_PHONE) == 120
     assert store.get_active_session(CHILD_PHONE) is None
+
+
+@pytest.mark.parametrize("outcome", ["granted", "blocked", "empty_bank", "no_profile", "invalid", "api_failed", "api_error"])
+def test_playtime_request_includes_pending_claims(tmp_path: Path, outcome: str) -> None:
+    manager, store = _build_two_child_manager(tmp_path)
+    store.set_bank_balance(CHILD_PHONE, 0 if outcome == "empty_bank" else 120)
+    submitted_at = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
+    store.add_activity_claim(CHILD_PHONE, 30, "30m played guitar", submitted_at)
+    store.mark_all_claims_handled(CHILD_PHONE)
+    store.add_activity_claim(CHILD_PHONE, 60, "1h cleaned room", submitted_at)
+    store.add_activity_claim(CHILD_PHONE, 30, "30m went for a walk", submitted_at)
+    store.add_activity_claim(SECOND_PHONE, 90, "1h30m other child's activity", submitted_at)
+    if outcome == "blocked":
+        store.set_child_block_mode(CHILD_PHONE, True)
+    elif outcome == "no_profile":
+        manager._active_profile_name_by_child.pop(CHILD_PHONE)
+
+    async def fake_grant(_child_id: str, _minutes: int, _mfa_handler: Any = None) -> bool:
+        assert outcome in {"granted", "api_failed", "api_error"}
+        if outcome == "api_error":
+            raise RuntimeError("API unavailable")
+        return outcome == "granted"
+
+    manager._grant_via_ms_api = fake_grant  # type: ignore[method-assign]
+    ctx = FakeContext(message_text="0m" if outcome == "invalid" else "30m", sender=CHILD_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert len(ctx.sent_messages) == 1
+    response = ctx.sent_messages[0]
+    assert "Pending claims for TestChild (2):" in response
+    assert "1h cleaned room (submitted 2025-01-06 12:00)" in response
+    assert "30m went for a walk" in response
+    assert "Total: 1h 30m" in response
+    assert "played guitar" not in response
+    assert "other child's activity" not in response
+    assert len(store.get_pending_claims(CHILD_PHONE)) == 2
+    assert (store.get_active_session(CHILD_PHONE) is not None) == (outcome == "granted")
+
+
+def test_playtime_request_without_pending_claims_omits_overview(tmp_path: Path) -> None:
+    manager, store = _build_manager(tmp_path)
+    store.set_bank_balance(CHILD_PHONE, 120)
+
+    async def fake_grant(_child_id: str, _minutes: int, _mfa_handler: Any = None) -> bool:
+        return True
+
+    manager._grant_via_ms_api = fake_grant  # type: ignore[method-assign]
+    ctx = FakeContext(message_text="30m", sender=CHILD_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert len(ctx.sent_messages) == 1
+    assert "claims" not in ctx.sent_messages[0].lower()
+    assert store.get_active_session(CHILD_PHONE) is not None
+
+
+def test_playtime_request_announces_authenticator_challenge_details(tmp_path: Path) -> None:
+    manager, store = _build_manager(tmp_path)
+    store.set_bank_balance(CHILD_PHONE, 120)
+
+    async def fake_grant(_child_id: str, _minutes: int, mfa_handler: Any = None) -> bool:
+        assert mfa_handler is not None
+        await mfa_handler("CIKJ5", 60)
+        return True
+
+    manager._grant_via_ms_api = fake_grant  # type: ignore[method-assign]
+    ctx = FakeContext(message_text="30m", sender=CHILD_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert len(ctx.sent_messages) == 2
+    assert "granting 30m to TestChild" in ctx.sent_messages[0]
+    assert "CIKJ5" in ctx.sent_messages[0]
+    assert "60s" in ctx.sent_messages[0]
+    assert "Granted 30m" in ctx.sent_messages[1]
 
 
 def test_playtime_manager_unknown_sender(tmp_path: Path) -> None:
@@ -288,7 +379,7 @@ def test_playtime_manager_admin_block_ends_active_session(tmp_path: Path) -> Non
     manager, store = _build_manager(tmp_path)
     store.set_bank_balance(CHILD_PHONE, 120)
 
-    async def fake_grant(child_id: str, minutes: int) -> bool:
+    async def fake_grant(child_id: str, minutes: int, _mfa_handler: Any = None) -> bool:
         return child_id == "child123" and minutes == 60
 
     manager._grant_via_ms_api = fake_grant  # type: ignore[method-assign]
@@ -296,7 +387,7 @@ def test_playtime_manager_admin_block_ends_active_session(tmp_path: Path) -> Non
     _run_handle(manager, grant_ctx)
     assert store.get_active_session(CHILD_PHONE) is not None
 
-    async def fake_block(child_id: str) -> bool:
+    async def fake_block(child_id: str, _mfa_handler: Any = None) -> bool:
         return child_id == "child123"
 
     manager._block_via_ms_api = fake_block  # type: ignore[method-assign]
@@ -313,7 +404,7 @@ def test_playtime_manager_child_request_denied_while_grant_block_mode_enabled(tm
     store.set_bank_balance(CHILD_PHONE, 120)
     store.set_child_block_mode(CHILD_PHONE, True)
 
-    async def fake_grant(_child_id: str, _minutes: int) -> bool:
+    async def fake_grant(_child_id: str, _minutes: int, _mfa_handler: Any = None) -> bool:
         raise AssertionError("grant API should not be called while block mode is enabled")
 
     manager._grant_via_ms_api = fake_grant  # type: ignore[method-assign]
@@ -330,7 +421,7 @@ def test_playtime_manager_child_request_accepts_compound_duration(tmp_path: Path
     manager, store = _build_manager(tmp_path)
     store.set_bank_balance(CHILD_PHONE, 120)
 
-    async def fake_grant(child_id: str, minutes: int) -> bool:
+    async def fake_grant(child_id: str, minutes: int, _mfa_handler: Any = None) -> bool:
         return child_id == "child123" and minutes == 90
 
     manager._grant_via_ms_api = fake_grant  # type: ignore[method-assign]
@@ -354,7 +445,7 @@ def test_playtime_manager_partial_grant_applies_multiple_caps(tmp_path: Path) ->
     rules._get_local_now = lambda: fixed_now  # type: ignore[method-assign]
     store.set_bank_balance(CHILD_PHONE, 20)
 
-    async def fake_grant(child_id: str, minutes: int) -> bool:
+    async def fake_grant(child_id: str, minutes: int, _mfa_handler: Any = None) -> bool:
         return child_id == "child123" and minutes == 20
 
     manager._grant_via_ms_api = fake_grant  # type: ignore[method-assign]
@@ -374,7 +465,7 @@ def test_playtime_manager_child_end_applies_block_then_ends_session(tmp_path: Pa
     now = rules._get_local_now()
     store.add_session(CHILD_PHONE, now - timedelta(minutes=5), 60)
 
-    async def fake_block(child_id: str) -> bool:
+    async def fake_block(child_id: str, _mfa_handler: Any = None) -> bool:
         return child_id == "child123"
 
     manager._block_via_ms_api = fake_block  # type: ignore[method-assign]
@@ -391,7 +482,7 @@ def test_playtime_manager_child_end_does_not_complete_when_block_fails(tmp_path:
     now = rules._get_local_now()
     session_id = store.add_session(CHILD_PHONE, now - timedelta(minutes=5), 60)
 
-    async def fake_block(_child_id: str) -> bool:
+    async def fake_block(_child_id: str, _mfa_handler: Any = None) -> bool:
         return False
 
     manager._block_via_ms_api = fake_block  # type: ignore[method-assign]
@@ -580,7 +671,7 @@ def test_admin_can_update_a_named_bank(tmp_path: Path) -> None:
 
 def test_fresh_install_requires_profile_definition_and_assignment(tmp_path: Path) -> None:
     manager, _store = _build_manager(tmp_path, default_rule_profile=None)
-    status = FakeContext(message_text="status", sender=ADMIN_PHONE, sent_messages=[])
+    status = FakeContext(message_text="status", sender=CHILD_PHONE, sent_messages=[])
     _run_handle(manager, status)
     assert manager._has_profile(CHILD_PHONE) is False
     assert len(status.sent_messages) == 1
@@ -640,6 +731,38 @@ def test_child_activity_claim_stored_and_bank_unchanged(tmp_path: Path) -> None:
     assert claims[0].description == "30m played guitar"
 
 
+@pytest.mark.parametrize(
+    ("language", "header", "total"),
+    [
+        ("en", "Pending claims for TestChild (2):", "Total: 1h 30m"),
+        ("fi", "Odottavat pyynnöt (TestChild, 2 kpl):", "Yhteensä: 1h 30m"),
+    ],
+)
+def test_activity_claim_response_includes_updated_pending_overview(
+    tmp_path: Path, language: str, header: str, total: str,
+) -> None:
+    manager, store = _build_two_child_manager(tmp_path, bot_language=language)
+    store.set_bank_balance(CHILD_PHONE, 60)
+    submitted_at = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
+    store.add_activity_claim(CHILD_PHONE, 60, "1h cleaned room", submitted_at)
+    store.add_activity_claim(SECOND_PHONE, 90, "1h30m other child's activity", submitted_at)
+
+    ctx = FakeContext(message_text="30m played guitar", sender=CHILD_PHONE, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert len(ctx.sent_messages) == 1
+    confirmation, overview = ctx.sent_messages[0].split("\n", 1)
+    assert "30m played guitar" in confirmation
+    assert header in overview
+    assert "1h cleaned room" in overview
+    assert "2025-01-06 12:00" in overview
+    assert "30m played guitar" in overview
+    assert total in overview
+    assert "other child's activity" not in overview
+    assert len(store.get_pending_claims(CHILD_PHONE)) == 2
+    assert store.get_bank_balance(CHILD_PHONE) == 60
+
+
 def test_admin_claims_lists_pending(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
     store.add_activity_claim(CHILD_PHONE, 30, "30m played guitar", datetime.now(timezone.utc))
@@ -649,6 +772,30 @@ def test_admin_claims_lists_pending(tmp_path: Path) -> None:
     _run_handle(manager, ctx)
 
     assert len(ctx.sent_messages) == 1
+
+
+@pytest.mark.parametrize("command", ["30m", "30m played guitar", "status", "claims", "ack"])
+@pytest.mark.parametrize(
+    ("submitted_at", "local_timestamp"),
+    [
+        (datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc), "2025-01-06 14:00"),
+        (datetime(2025, 7, 6, 12, 0, tzinfo=timezone.utc), "2025-07-06 15:00"),
+        (datetime(2025, 7, 6, 22, 0, tzinfo=timezone.utc), "2025-07-07 01:00"),
+    ],
+)
+def test_claim_submission_times_use_configured_timezone(
+    tmp_path: Path, command: str, submitted_at: datetime, local_timestamp: str,
+) -> None:
+    manager, store = _build_manager(tmp_path, timezone="Europe/Helsinki")
+    store.add_activity_claim(CHILD_PHONE, 60, "1h cleaned room", submitted_at)
+    store.set_child_block_mode(CHILD_PHONE, True)
+    sender = ADMIN_PHONE if command in {"claims", "ack"} else CHILD_PHONE
+
+    ctx = FakeContext(message_text=command, sender=sender, sent_messages=[])
+    _run_handle(manager, ctx)
+
+    assert len(ctx.sent_messages) == 1
+    assert f"1h cleaned room (submitted {local_timestamp})" in ctx.sent_messages[0]
 
 
 def test_admin_ack_grants_total_and_clears_claims(tmp_path: Path) -> None:

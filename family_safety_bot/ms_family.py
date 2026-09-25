@@ -1,21 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from html import unescape
-from urllib.parse import urljoin
+from pathlib import Path
+from typing import Awaitable, Callable
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 
 from family_safety_bot.formatting import format_duration
 
 logger = logging.getLogger(__name__)
+MfaChallengeHandler = Callable[[str, int], Awaitable[None]]
 
-_FAMILY_URL = "https://account.microsoft.com/family"
-_FAMILY_HOME_URL = "https://account.microsoft.com/family/home"
-_LOGIN_URL = "https://login.live.com/login.srf"
+_FAMILY_URL = "https://account.microsoft.com/family/home"
 _SCREEN_TIME_ENDPOINT = "https://account.microsoft.com/family/api/screen-time-request"
 _ROSTER_ENDPOINT = "https://account.microsoft.com/family/api/roster"
 _SCREEN_TIME_OVERRIDE_ENDPOINT = "https://account.microsoft.com/family/api/device-limits/screentime-time-override"
@@ -40,9 +43,13 @@ _WEB_HEADERS = {
 class MicrosoftFamilyApi:
     """Client for Microsoft Family Safety web endpoints."""
 
-    def __init__(self, email: str, password: str) -> None:
+    def __init__(
+        self,
+        email: str,
+        session_path: str | Path | None = None,
+    ) -> None:
         self._email = email
-        self._password = password
+        self._session_path = Path(session_path) if session_path else None
         self._client: httpx.AsyncClient | None = None
         self._authenticated = False
         self._last_status_code: int | None = None
@@ -57,26 +64,37 @@ class MicrosoftFamilyApi:
         self._client = None
         self._authenticated = False
 
-    async def ensure_authenticated(self, force: bool = False) -> None:
+    async def ensure_authenticated(
+        self,
+        force: bool = False,
+        mfa_challenge_handler: MfaChallengeHandler | None = None,
+    ) -> None:
         if force:
             await self.aclose()
+            self._discard_session_file()
 
         if self._client and self._authenticated:
-            check = await self._client.get(_FAMILY_HOME_URL)
+            check = await self._client.get(_FAMILY_URL)
             if self._is_authenticated_family_response(check):
                 return
             logger.info("Existing Family Safety session appears expired; re-authenticating.")
             await self.aclose()
+            self._discard_session_file()
 
-        await self._authenticate_web()
+        await self._authenticate_web(mfa_challenge_handler)
 
     def _require_client(self) -> httpx.AsyncClient:
         if self._client is None:
             raise RuntimeError("MicrosoftFamilyApi client is not initialized")
         return self._client
 
-    async def _authenticate_web(self) -> None:
+    async def _authenticate_web(
+        self,
+        mfa_challenge_handler: MfaChallengeHandler | None = None,
+    ) -> None:
         logger.info("Authenticating with Microsoft Family Safety web portal...")
+        if self._client is not None:
+            await self._client.aclose()
         self._client = httpx.AsyncClient(
             headers=_WEB_HEADERS,
             timeout=httpx.Timeout(30.0),
@@ -84,8 +102,29 @@ class MicrosoftFamilyApi:
         )
         client = self._require_client()
 
-        login_page_response = await client.get(_LOGIN_URL)
-        if "login.live.com" not in str(login_page_response.url).lower():
+        if self._load_session_cookies():
+            cached_response = await client.get(_FAMILY_URL)
+            if self._is_authenticated_family_response(cached_response):
+                logger.info("Restored Microsoft Family Safety session from disk")
+                self._authenticated = True
+                return
+            logger.info("Stored Microsoft Family Safety session has expired")
+            client.cookies.clear()
+            self._discard_session_file()
+
+        family_entry_response = await client.get(_FAMILY_URL, follow_redirects=False)
+        authorization_url = family_entry_response.headers.get("location")
+        if not authorization_url:
+            raise ValueError(
+                "Authentication flow did not reach Microsoft authorization endpoint. "
+                f"Family Safety returned status {family_entry_response.status_code}."
+            )
+        authorization_url = self._interactive_authorization_url(
+            urljoin(str(family_entry_response.url), authorization_url)
+        )
+        login_page_response = await client.get(authorization_url)
+        login_host = login_page_response.url.host.lower() if login_page_response.url.host else ""
+        if login_host not in {"login.live.com", "login.microsoftonline.com"}:
             raise ValueError(
                 "Authentication flow did not reach Microsoft login page. "
                 f"Final URL was: {login_page_response.url}"
@@ -96,74 +135,311 @@ class MicrosoftFamilyApi:
         if not ppft:
             raise ValueError("Could not find PPFT token on login page")
 
-        url_post = self._extract_login_post_url(
-            login_page_response.text,
-            server_data,
-            str(login_page_response.url),
+        if mfa_challenge_handler is None:
+            raise ValueError(
+                "Microsoft Authenticator approval is required, but no challenge handler "
+                "was provided"
+            )
+        submit_response = await self._complete_passwordless_challenge(
+            login_page_response,
+            server_data or {},
+            ppft,
+            mfa_challenge_handler,
         )
-        form_fields = {
-            "PPFT": ppft,
-            "login": self._email,
-            "passwd": self._password,
-        }
 
-        submit_response = await client.post(
-            url_post,
-            data=form_fields,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": "https://login.live.com",
-                "Referer": str(login_page_response.url),
-            },
-        )
         self._raise_on_login_error(submit_response)
-        submit_response = await self._complete_sign_in_handoffs(submit_response)
+        await self._complete_sign_in_handoffs(submit_response)
 
-        family_response = await self._finalize_family_session()
+        family_response = await client.get(_FAMILY_URL)
         if not self._is_authenticated_family_response(family_response):
             raise ValueError("Authentication failed: Family Safety session was not established")
 
         logger.info("Successfully authenticated with Microsoft Family Safety web portal")
         self._authenticated = True
+        self._save_session_cookies()
 
-    async def _follow_html_form_redirects(self, response: httpx.Response) -> httpx.Response:
-        current = response
-        client = self._require_client()
-        for _ in range(3):
-            parsed = self._parse_auto_submit_form(current.text)
-            if not parsed:
-                break
-            action, method, fields = parsed
-            target = urljoin(str(current.url), action)
-            if method.lower() == "post":
-                current = await client.post(target, data=fields)
-            else:
-                current = await client.get(target, params=fields)
-        return current
+    def _load_session_cookies(self) -> bool:
+        if not self._session_path or not self._session_path.exists():
+            return False
+        try:
+            records = json.loads(self._session_path.read_text(encoding="utf-8"))
+            if not isinstance(records, list):
+                raise ValueError("cookie file is not a list")
+            client = self._require_client()
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                client.cookies.set(
+                    str(record["name"]),
+                    str(record["value"]),
+                    domain=str(record["domain"]),
+                    path=str(record.get("path") or "/"),
+                )
+            return bool(records)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("Ignoring invalid Microsoft session file %s: %s", self._session_path, exc)
+            return False
 
-    async def _follow_client_side_redirects(self, response: httpx.Response) -> httpx.Response:
-        current = response
-        client = self._require_client()
-        for _ in range(4):
-            next_url = self._extract_client_side_redirect_url(current.text)
-            if not next_url:
-                break
-            current = await client.get(urljoin(str(current.url), next_url))
-        return current
+    def _save_session_cookies(self) -> None:
+        if not self._session_path:
+            return
+        records = [
+            {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "path": cookie.path,
+            }
+            for cookie in self._require_client().cookies.jar
+        ]
+        self._session_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._session_path.with_suffix(self._session_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(records, separators=(",", ":")), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        temporary.replace(self._session_path)
 
-    async def _finalize_family_session(self) -> httpx.Response:
+    def _discard_session_file(self) -> None:
+        if not self._session_path:
+            return
+        try:
+            self._session_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Could not remove Microsoft session file: %s", exc)
+
+    async def _complete_passwordless_challenge(
+        self,
+        login_response: httpx.Response,
+        server_data: dict,
+        flow_token: str,
+        challenge_handler: MfaChallengeHandler,
+    ) -> httpx.Response:
         client = self._require_client()
-        last_response: httpx.Response | None = None
-        for _ in range(4):
-            response = await client.get(_FAMILY_URL)
-            response = await self._follow_html_form_redirects(response)
-            response = await self._follow_client_side_redirects(response)
-            last_response = response
-            if self._is_authenticated_family_response(response):
-                break
-        if last_response is None:
-            raise RuntimeError("Failed to resolve Family Safety session")
-        return last_response
+        credential_url = server_data.get("urlGetCredentialType")
+        if not isinstance(credential_url, str) or not credential_url:
+            raise ValueError("Microsoft login page did not provide a credential discovery endpoint")
+
+        credential_response = await client.post(
+            urljoin(str(login_response.url), credential_url),
+            json={
+                "checkPhones": False,
+                "country": str(server_data.get("country") or ""),
+                "federationFlags": int(server_data.get("iGctFederationFlags") or 0),
+                "flowToken": flow_token,
+                "forceotclogin": False,
+                "isCookieBannerShown": bool(server_data.get("fShowCookieBanner")),
+                "isExternalFederationDisallowed": bool(
+                    server_data.get("fIsExternalFederationDisallowed")
+                ),
+                "isFederationDisabled": bool(server_data.get("fIsFedDisabled")),
+                "isFidoSupported": bool(server_data.get("fIsFidoSupported")),
+                "isOtherIdpSupported": True,
+                "isReactLoginRequest": True,
+                "isRemoteConnectSupported": bool(server_data.get("fRemoteConnectEnabled")),
+                "isRemoteNGCSupported": True,
+                "isSignup": False,
+                "originalRequest": str(server_data.get("sCtx") or ""),
+                "otclogindisallowed": bool(server_data.get("fIsOtcLoginDisabled")),
+                "uaid": self._query_value(credential_url, "uaid"),
+                "username": self._email,
+            },
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Referer": str(login_response.url),
+            },
+        )
+        credential_response.raise_for_status()
+        credential_data = credential_response.json()
+        credentials = credential_data.get("Credentials") or {}
+        remote = credentials.get("RemoteNgcParams") or {}
+        session_key = remote.get("SessionIdentifier")
+        if not credentials.get("HasRemoteNGC") or not isinstance(session_key, str) or not session_key:
+            raise ValueError("Microsoft Authenticator passwordless sign-in is unavailable for this account")
+
+        one_time_code_url = server_data.get("urlGetOneTimeCode")
+        if not isinstance(one_time_code_url, str) or not one_time_code_url:
+            parsed_login_url = urlsplit(str(login_response.url))
+            endpoint_query: dict[str, str] = {}
+            login_query = dict(parse_qsl(parsed_login_url.query, keep_blank_values=True))
+            if market := login_query.get("mkt"):
+                endpoint_query["mkt"] = market
+            if locale_id := server_data.get("iRequestLCID") or login_query.get("lc"):
+                endpoint_query["lcid"] = str(locale_id)
+            for field, parameter in (
+                ("sSiteId", "id"),
+                ("sClientId", "client_id"),
+                ("sForwardedClientId", "fci"),
+                ("sNoPaBubbleVersion", "nopa"),
+            ):
+                if value := server_data.get(field):
+                    endpoint_query[parameter] = str(value)
+            one_time_code_url = urlunsplit(
+                parsed_login_url._replace(path="/GetOneTimeCode.srf", query=urlencode(endpoint_query))
+            )
+        uaid = self._query_value(credential_url, "uaid")
+        otc_response = await client.post(
+            urljoin(str(login_response.url), one_time_code_url),
+            data={
+                "login": self._email,
+                "flowtoken": session_key,
+                "purpose": "eOTT_RemoteNGC",
+                "channel": "PushNotifications",
+                "SAPId": "",
+                "ChallengeViewSupported": str(server_data.get("iUXMode") or 0),
+                "uaid": uaid,
+                "canaryFlowToken": flow_token,
+            },
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": str(login_response.url),
+            },
+        )
+        otc_response.raise_for_status()
+        otc_data = otc_response.json()
+        completion_token = str(otc_data.get("flowToken") or otc_data.get("FlowToken") or "")
+        if not completion_token:
+            raise ValueError("Microsoft did not return an Authenticator flow token")
+        display_id = str(
+            otc_data.get("displaySignForUI")
+            or otc_data.get("DisplaySignForUI")
+            or remote.get("Entropy")
+            or "unknown"
+        )
+        timeout_seconds = max(1, int(server_data.get("iPollingTimeout") or 60))
+        polling_interval = max(1, int(server_data.get("iPollingInterval") or 1))
+        await challenge_handler(display_id, timeout_seconds)
+
+        session_state_url = server_data.get("urlSessionState")
+        if not isinstance(session_state_url, str) or not session_state_url:
+            raise ValueError("Microsoft login page did not provide an Authenticator status endpoint")
+        await self._poll_authenticator(
+            urljoin(str(login_response.url), session_state_url),
+            session_key,
+            timeout_seconds,
+            polling_interval,
+            "NGC",
+            str(login_response.url),
+        )
+
+        post_url = server_data.get("urlPostMsa") or server_data.get("urlPost")
+        if not isinstance(post_url, str) or not post_url:
+            raise ValueError("Microsoft login page did not provide a sign-in completion endpoint")
+        username = str(credential_data.get("Username") or self._email)
+        display_username = str(credential_data.get("Display") or username)
+        completion_fields = {
+            "slk": session_key,
+            "uaid": uaid,
+            "ps": "4",
+            "psRNGCDefaultType": str(remote.get("DefaultType") or ""),
+            "psRNGCEntropy": display_id,
+            "psRNGCSLK": session_key,
+            "canary": str(server_data.get("sCanary") or server_data.get("sCanaryToken") or ""),
+            "ctx": str(server_data.get("sCtx") or ""),
+            "hpgrequestid": "",
+            "PPFT": completion_token,
+            "PPSX": str(server_data.get("sRandomBlob") or ""),
+            "NewUser": "1",
+            "FoundMSAs": str(server_data.get("sFoundMSAs") or ""),
+            "fspost": "1" if server_data.get("fPOST_ForceSignin") else "0",
+            "i21": "0",
+            "CookieDisclosure": "1" if server_data.get("fShowCookieBanner") else "0",
+            "IsFidoSupported": "1" if server_data.get("fIsFidoSupported") else "0",
+            "isSignupPost": "0",
+            "isRecoveryAttemptPost": "0",
+            "i13": "0",
+            "login": username.strip().lower(),
+            "loginfmt": display_username,
+            "type": "21",
+            "LoginOptions": "3",
+            "lrt": "",
+            "lrtPartition": "",
+            "hisRegion": "",
+            "hisScaleUnit": "",
+            "cpr": "0",
+        }
+        return await client.post(
+            urljoin(str(login_response.url), post_url),
+            data=completion_fields,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": f"{login_response.url.scheme}://{login_response.url.host}",
+                "Referer": str(login_response.url),
+            },
+            follow_redirects=False,
+        )
+
+    async def _poll_authenticator(
+        self,
+        poll_url: str,
+        session_key: str,
+        timeout_seconds: int,
+        polling_interval: int,
+        session_key_type: str | None,
+        referer: str,
+    ) -> None:
+        client = self._require_client()
+        poll_url = self._session_approval_poll_url(poll_url, session_key, session_key_type)
+        attempts = max(1, (timeout_seconds + polling_interval - 1) // polling_interval)
+        last_state: dict = {}
+        for attempt in range(attempts):
+            response = await client.post(
+                poll_url,
+                json={"DeviceCode": session_key},
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": referer,
+                },
+            )
+            response.raise_for_status()
+            state = {str(key).lower(): value for key, value in response.json().items()}
+            if state != last_state:
+                logger.info("Microsoft Authenticator state: %s", state)
+                last_state = state
+            authorization_state = state.get("authorizationstate")
+            if authorization_state == 2:
+                return
+            if authorization_state == 1:
+                raise ValueError("Microsoft Authenticator request was denied")
+            if authorization_state == 6:
+                detail = state.get("code")
+                raise ValueError(
+                    "Microsoft Authenticator request failed" + (f" ({detail})" if detail else "")
+                )
+            if authorization_state not in (0, 7):
+                raise ValueError(
+                    f"Microsoft returned an invalid Authenticator state ({authorization_state!r})"
+                )
+            if attempt + 1 < attempts:
+                await asyncio.sleep(polling_interval)
+        raise ValueError(f"Microsoft Authenticator approval timed out (last state: {last_state})")
+
+    @staticmethod
+    def _query_value(url: str, name: str) -> str:
+        return dict(parse_qsl(urlsplit(url).query, keep_blank_values=True)).get(name, "")
+
+    @staticmethod
+    def _interactive_authorization_url(url: str) -> str:
+        """Request an actual login page instead of OAuth's silent-login callback."""
+        parsed = urlsplit(url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        query["prompt"] = "login"
+        return urlunsplit(parsed._replace(query=urlencode(query)))
+
+    @staticmethod
+    def _session_approval_poll_url(
+        url: str,
+        session_key: str,
+        session_key_type: str | None = None,
+    ) -> str:
+        parsed = urlsplit(url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        query["slk"] = session_key
+        if session_key_type:
+            query["slkt"] = session_key_type
+        return urlunsplit(parsed._replace(query=urlencode(query)))
 
     async def _complete_sign_in_handoffs(self, response: httpx.Response) -> httpx.Response:
         current = response
@@ -172,11 +448,10 @@ class MicrosoftFamilyApi:
         server_data = self._extract_server_data(current.text)
         if isinstance(server_data, dict):
             url_post = server_data.get("urlPost")
-            ppft = server_data.get("sFT")
-            if isinstance(url_post, str) and url_post and isinstance(ppft, str) and ppft:
-                # After the credential post, Microsoft emits a JS-driven intermediate
-                # sign-in step. The minimal reliable payload we observed for that
-                # follow-up post is PPFT + type=28 + login + loginfmt.
+            ppft = self._extract_ppft(current.text, server_data)
+            if isinstance(url_post, str) and url_post and ppft:
+                # Accept the "stay signed in" continuation so Microsoft issues the
+                # persistent cookies saved after the Family session resolves.
                 current = await client.post(
                     url_post,
                     data={
@@ -184,6 +459,14 @@ class MicrosoftFamilyApi:
                         "type": "28",
                         "login": self._email,
                         "loginfmt": self._email,
+                        "LoginOptions": "1",
+                        "ctx": str(server_data.get("sCtx") or ""),
+                        "hpgrequestid": str(server_data.get("sessionId") or ""),
+                        "canary": str(
+                            server_data.get("sCanary")
+                            or server_data.get("sCanaryToken")
+                            or ""
+                        ),
                     },
                     headers={
                         "Content-Type": "application/x-www-form-urlencoded",
@@ -216,10 +499,7 @@ class MicrosoftFamilyApi:
                     current = await client.post(
                         target,
                         data=fields,
-                        headers={
-                            "Content-Type": "application/x-www-form-urlencoded",
-                            "Referer": str(current.url),
-                        },
+                        headers=self._form_navigation_headers(str(current.url), target),
                         follow_redirects=False,
                     )
                 else:
@@ -234,6 +514,33 @@ class MicrosoftFamilyApi:
             break
 
         return current
+
+    @staticmethod
+    def _form_navigation_headers(source_url: str, target_url: str) -> dict[str, str]:
+        source = urlsplit(source_url)
+        target = urlsplit(target_url)
+        source_origin = f"{source.scheme}://{source.netloc}"
+        target_origin = f"{target.scheme}://{target.netloc}"
+        referer = source_url if source_origin == target_origin else source_origin + "/"
+        if source_origin == target_origin:
+            fetch_site = "same-origin"
+        elif MicrosoftFamilyApi._registrable_site(source.hostname) == MicrosoftFamilyApi._registrable_site(target.hostname):
+            fetch_site = "same-site"
+        else:
+            fetch_site = "cross-site"
+        return {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": source_origin,
+            "Referer": referer,
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": fetch_site,
+        }
+
+    @staticmethod
+    def _registrable_site(hostname: str | None) -> str:
+        labels = (hostname or "").split(".")
+        return ".".join(labels[-2:]) if len(labels) >= 2 else (hostname or "")
 
     async def _ensure_ready_client(self) -> httpx.AsyncClient:
         if not self._client or not self._authenticated:
@@ -438,18 +745,32 @@ class MicrosoftFamilyApi:
 
     @staticmethod
     def _raise_on_login_error(response: httpx.Response) -> None:
-        text = response.text.lower()
         url = str(response.url).lower()
+        if MicrosoftFamilyApi._is_authenticated_family_response(response):
+            return
+
+        server_data = MicrosoftFamilyApi._extract_server_data(response.text)
+        if isinstance(server_data, dict):
+            error_text = str(server_data.get("sErrTxt") or "").lower()
+            if not server_data.get("fHasError") and not error_text:
+                text = ""
+            else:
+                text = error_text or response.text.lower()
+        else:
+            text = response.text.lower()
+
         for keywords, message in (
-            (["password is incorrect", "password you entered is incorrect"], "Login failed: Incorrect password"),
             (["account doesn't exist", "couldn't find your account"], "Login failed: Account doesn't exist"),
         ):
             if any(kw in text for kw in keywords):
                 raise ValueError(message)
         if "help us protect your account" in text:
-            raise ValueError("Microsoft requires additional verification")
+            raise ValueError(
+                "Microsoft requires additional verification. Sign in interactively at "
+                "https://account.microsoft.com and complete the requested account check."
+            )
         if "proofup" in url or "mfaenter" in url:
-            raise ValueError("Two-factor authentication detected but not supported")
+            raise ValueError("Microsoft requires an additional interactive account check")
 
     @staticmethod
     def _is_authenticated_family_response(response: httpx.Response) -> bool:
@@ -487,31 +808,25 @@ class MicrosoftFamilyApi:
 
     @staticmethod
     def _extract_ppft(page_content: str, server_data: dict | None) -> str | None:
-        if match := re.search(r'name=["\']PPFT["\'][^>]*value=["\']([^"\']+)["\']', page_content):
-            return match.group(1)
-        if match := re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']PPFT["\']', page_content):
-            return match.group(1)
+        if server_data and isinstance(ppft := server_data.get("sFT"), str) and ppft:
+            extracted = unescape(ppft)
+            if match := re.search(r'value=["\']([^"\']+)["\']', extracted):
+                return match.group(1)
+            return extracted
         if server_data and isinstance(ppft := server_data.get("sFTTag"), str):
             if match := re.search(r'name=["\']PPFT["\'][^>]*value=["\']([^"\']+)["\']', unescape(ppft)):
                 return match.group(1)
+        if match := re.search(r'name=["\']PPFT["\'][^>]*value=["\']([^"\']+)["\']', page_content):
+            return unescape(match.group(1))
+        if match := re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']PPFT["\']', page_content):
+            return unescape(match.group(1))
         return None
 
     @staticmethod
-    def _extract_login_post_url(page_content: str, server_data: dict | None, fallback: str) -> str:
-        url_post_match = re.search(r'urlPost:\s*[\'"]([^\'\"]+)[\'"]', page_content)
-        if url_post_match:
-            return url_post_match.group(1).replace("&amp;", "&")
-        if server_data:
-            json_url_post = server_data.get("urlPost") or server_data.get("urlPostMsa")
-            if isinstance(json_url_post, str) and json_url_post:
-                return unescape(json_url_post).replace("&amp;", "&")
-        action_match = re.search(r'<form[^>]*action=["\']([^"\']+)["\']', page_content)
-        if action_match:
-            return action_match.group(1).replace("&amp;", "&")
-        return fallback
-
-    @staticmethod
     def _parse_auto_submit_form(html: str) -> tuple[str, str, dict[str, str]] | None:
+        if not re.search(r"\.submit\s*\(", html, re.IGNORECASE):
+            return None
+
         for form_match in re.finditer(r"<form(?P<attrs>[^>]*)>(?P<body>.*?)</form>", html, re.IGNORECASE | re.DOTALL):
             attrs = MicrosoftFamilyApi._parse_html_attributes(form_match.group("attrs"))
             if not (action := attrs.get("action")):
@@ -532,14 +847,15 @@ class MicrosoftFamilyApi:
 
     @staticmethod
     def _extract_client_side_redirect_url(html: str) -> str | None:
-        meta = re.search(
-            r'<meta[^>]*http-equiv=["\']refresh["\'][^>]*content=["\'][^"\']*;\s*([^"\']+)["\']',
-            html,
-            re.IGNORECASE,
-        )
-        if meta:
-            content = unescape(meta.group(1)).strip()
-            return content[4:] if content.lower().startswith("url=") else content
+        for meta in re.finditer(r"<meta(?P<attrs>[^>]*)>", html, re.IGNORECASE):
+            attrs = MicrosoftFamilyApi._parse_html_attributes(meta.group("attrs"))
+            if attrs.get("http-equiv", "").lower() != "refresh":
+                continue
+            _delay, separator, target = attrs.get("content", "").partition(";")
+            if not separator:
+                continue
+            target = target.strip()
+            return target[4:].strip() if target.lower().startswith("url=") else target
 
         js_replace = re.search(
             r'window\.location\.(?:replace|assign)\(\s*["\']([^"\']+)["\']\s*\)',

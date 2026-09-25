@@ -56,7 +56,6 @@ CHILD_1_MS_ID=1234567890123456
 CHILD_1_NAME=Alice
 
 MS_FAMILY_EMAIL=parent@example.com
-MS_FAMILY_PASSWORD=your_password_here
 
 TZ=Europe/Helsinki
 DATA_DIR=./data
@@ -71,6 +70,16 @@ Rule profiles are created through admin commands, not environment settings. A fr
 docker compose up -d
 docker compose logs -f playtime-bot
 ```
+
+On the first Microsoft operation, the bot sends the Authenticator number-match
+code to the Signal group. Approve that passwordless sign-in once. The bot stores
+the resulting Microsoft session in `DATA_DIR/ms-family-session.json` with
+owner-only permissions and reuses it across requests and restarts. It asks for a
+new approval only after Microsoft expires the stored session.
+
+An admin `status` command (`tila` in Finnish) validates this Microsoft session
+before reporting child status. This check does not grant or block time, and is a
+safe way to renew authentication before it is needed for a playtime request.
 
 Then define and assign a profile in Signal. This example recreates a long-term earned-time bank plus a 30-hour weekly allowance:
 

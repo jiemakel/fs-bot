@@ -104,6 +104,17 @@ def normalize_profile_name(name: str) -> str:
     return normalized
 
 
+def parse_day_count(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip().lower()
+    if text.endswith("d"):
+        text = text[:-1].strip()
+    return int(text) if text.isdigit() else None
+
+
 def parse_rule_profile_definition(name: str, definition: Any) -> RuleProfile:
     """Parse a strict JSON-compatible profile definition."""
     if not isinstance(definition, dict):
@@ -144,16 +155,6 @@ def parse_rule_profile_definition(name: str, definition: Any) -> RuleProfile:
                     raise ValueError(f"Duplicate day in bank {bank_name!r}: {day!r}.")
                 parsed_days.append(weekday)
             bank_days = tuple(parsed_days)
-
-            def parse_day_count(value: Any) -> int | None:
-                if isinstance(value, bool):
-                    return None
-                if isinstance(value, int):
-                    return value
-                text = str(value).strip().lower()
-                if text.endswith("d"):
-                    text = text[:-1].strip()
-                return int(text) if text.isdigit() else None
 
             max_minutes = parse_day_count(raw_bank["max_balance"])
         else:
@@ -214,9 +215,8 @@ def parse_rule_profile_definition(name: str, definition: Any) -> RuleProfile:
 
 @dataclass(frozen=True)
 class Settings:
-    # Microsoft Family Safety credentials
+    # Microsoft Family Safety identity
     ms_family_email: str
-    ms_family_password: str
     
     # Signal configuration
     children: dict[str, Child]  # Keyed by phone_number for fast lookup
@@ -269,7 +269,6 @@ class Settings:
 
         return Settings(
             ms_family_email=env.get("MS_FAMILY_EMAIL", ""),
-            ms_family_password=env.get("MS_FAMILY_PASSWORD", ""),
             children=children,
             signal_admins=signal_admins,
             signal_group_id=signal_group_id,

@@ -32,7 +32,6 @@ services:
       CHILD_2_NAME: ${CHILD_2_NAME}
 
       MS_FAMILY_EMAIL: ${MS_FAMILY_EMAIL}
-      MS_FAMILY_PASSWORD: ${MS_FAMILY_PASSWORD}
 
       TZ: ${TZ}
       DATA_DIR: ${DATA_DIR}

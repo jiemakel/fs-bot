@@ -25,18 +25,16 @@ def _configured_child_id() -> str | None:
         index += 1
 
 
-def _require_live_ms_family_env() -> tuple[str, str, str]:
+def _require_live_ms_family_env() -> tuple[str, str]:
     if os.environ.get("LIVE_TEST") != "1":
         pytest.skip("Set LIVE_TEST=1 to run Microsoft Family Safety live tests")
 
     email = os.environ.get("MS_FAMILY_EMAIL", "").strip()
-    password = os.environ.get("MS_FAMILY_PASSWORD", "")
     child_id = _configured_child_id()
     missing = [
         key
         for key, value in (
             ("MS_FAMILY_EMAIL", email),
-            ("MS_FAMILY_PASSWORD", password),
             ("LIVE_MS_FAMILY_CHILD_ID or CHILD_1_MS_ID", child_id),
         )
         if not value
@@ -45,11 +43,11 @@ def _require_live_ms_family_env() -> tuple[str, str, str]:
         pytest.skip(f"Missing live Microsoft Family Safety env: {', '.join(missing)}")
 
     assert child_id is not None
-    return email, password, child_id
+    return email, child_id
 
 
-async def _assert_readonly_family_api_canary(email: str, password: str, child_id: str) -> None:
-    api = MicrosoftFamilyApi(email, password)
+async def _assert_readonly_family_api_canary(email: str, child_id: str) -> None:
+    api = MicrosoftFamilyApi(email, session_path="data/ms-family-session.json")
     try:
         await api.ensure_authenticated()
         client = api._require_client()
@@ -71,6 +69,6 @@ async def _assert_readonly_family_api_canary(email: str, password: str, child_id
 
 
 def test_ms_family_live_authentication_and_roster_are_readable() -> None:
-    email, password, child_id = _require_live_ms_family_env()
+    email, child_id = _require_live_ms_family_env()
 
-    asyncio.run(_assert_readonly_family_api_canary(email, password, child_id))
+    asyncio.run(_assert_readonly_family_api_canary(email, child_id))

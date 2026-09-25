@@ -13,7 +13,7 @@ def _build_rules(tmp_path: Path, **settings_overrides: Any) -> PlaytimeRules:
         CHILD_PHONE,
         settings,
         store,
-        profile_provider=lambda: settings.default_rule_profile,
+        profile_provider=lambda: settings.configured_rule_profile,
     )
 
 
@@ -92,7 +92,7 @@ def test_playtime_rules_partial_grant_applies_active_limiters(tmp_path: Path) ->
 def test_playtime_rules_basic_request(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
 
     store.set_bank_balance(CHILD_PHONE, 300)
 
@@ -114,7 +114,7 @@ def test_playtime_rules_basic_request(tmp_path: Path) -> None:
 def test_playtime_rules_exceeds_bank_balance(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
 
     store.set_bank_balance(CHILD_PHONE, 30)
 
@@ -132,7 +132,7 @@ def test_playtime_rules_secondary_bank_caps_grants(tmp_path: Path) -> None:
             "weekly": BankProfile("weekly", 90, 90),
         },
     )
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
     now = datetime(2025, 1, 8, 12, 0, tzinfo=timezone.utc)
     rules._get_local_now = lambda: now  # type: ignore[method-assign]
     store.set_bank_balance(CHILD_PHONE, 300)
@@ -155,7 +155,7 @@ def test_day_bank_only_applies_on_matching_days_and_taps_once(tmp_path: Path) ->
             "weekends": BankProfile("weekends", 2, 2, days=(5, 6)),
         },
     )
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
     monday = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
     rules._get_local_now = lambda: monday  # type: ignore[method-assign]
     store.set_bank_balance(CHILD_PHONE, 300, "time")
@@ -183,7 +183,7 @@ def test_empty_matching_day_bank_denies_but_nonmatching_bank_does_not(tmp_path: 
             "weekends": BankProfile("weekends", 2, 2, days=(5, 6)),
         },
     )
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
     store.set_bank_balance(CHILD_PHONE, 300, "time")
     store.set_bank_balance(CHILD_PHONE, 0, "weekdays")
     store.set_bank_balance(CHILD_PHONE, 1, "weekends")
@@ -206,7 +206,7 @@ def test_day_banks_cap_grants_at_local_midnight(tmp_path: Path) -> None:
             "weekdays": BankProfile("weekdays", 3, 5, days=(0, 1, 2, 3, 4)),
         },
     )
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
     rules._get_local_now = lambda: datetime(2025, 1, 6, 23, 30, tzinfo=timezone.utc)  # type: ignore[method-assign]
     store.set_bank_balance(CHILD_PHONE, 300, "time")
     store.set_bank_balance(CHILD_PHONE, 2, "weekdays")
@@ -227,7 +227,7 @@ def test_playtime_rules_ending_early_refunds_every_bank(tmp_path: Path) -> None:
             "weekly": BankProfile("weekly", 90, 90),
         },
     )
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
     start = datetime(2025, 1, 8, 12, 0, tzinfo=timezone.utc)
     rules._get_local_now = lambda: start  # type: ignore[method-assign]
     store.set_bank_balance(CHILD_PHONE, 300)
@@ -254,7 +254,7 @@ def test_playtime_rules_blackout_full_day_period(tmp_path: Path) -> None:
 def test_recovery_bank_refills_only_after_complete_break(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
     store.set_bank_balance(CHILD_PHONE, 300)
     base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
     store.set_bank_balance(CHILD_PHONE, 90, "recovery", base)
@@ -271,7 +271,7 @@ def test_recovery_bank_refills_only_after_complete_break(tmp_path: Path) -> None
 def test_natural_session_end_starts_recovery_bank_break(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
     start = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
     rules._get_local_now = lambda: start  # type: ignore[method-assign]
     store.set_bank_balance(CHILD_PHONE, 300)
@@ -290,7 +290,7 @@ def test_recovery_bank_completion_notification_is_one_shot(tmp_path: Path) -> No
     store = build_store(tmp_path)
     settings = build_settings(tmp_path)
     i18n = RecordingI18n()
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile, i18n=i18n)  # type: ignore[arg-type]
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile, i18n=i18n)  # type: ignore[arg-type]
     base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
     store.set_bank_balance(CHILD_PHONE, 90, "recovery", base)
     rules._get_local_now = lambda: base + timedelta(minutes=30)  # type: ignore[method-assign]
@@ -302,7 +302,7 @@ def test_recovery_bank_completion_notification_is_one_shot(tmp_path: Path) -> No
 def test_recovery_break_progress_is_restored_after_quick_stop(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
     base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
     grant_at = base + timedelta(minutes=20)
     stop_at = grant_at + timedelta(seconds=30)
@@ -327,7 +327,7 @@ def test_recovery_break_progress_is_restored_after_quick_stop(tmp_path: Path) ->
 def test_recovery_break_progress_resets_after_grace_expires(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
     base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
     grant_at = base + timedelta(minutes=20)
     stop_at = grant_at + timedelta(minutes=2, seconds=1)
@@ -346,7 +346,7 @@ def test_recovery_break_progress_resets_after_grace_expires(tmp_path: Path) -> N
 def test_playtime_rules_active_session_request_uses_surplus_only(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
 
     now = rules._get_local_now()
     store.set_bank_balance(CHILD_PHONE, 200)
@@ -368,7 +368,7 @@ def test_playtime_rules_active_session_request_uses_surplus_only(tmp_path: Path)
 def test_playtime_rules_active_session_smaller_request_no_refund(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
 
     now = rules._get_local_now()
     store.set_bank_balance(CHILD_PHONE, 200)
@@ -395,7 +395,7 @@ def test_playtime_rules_status_reports_each_bank_against_its_maximum(tmp_path: P
         CHILD_PHONE,
         settings,
         store,
-        profile_provider=lambda: settings.default_rule_profile,
+        profile_provider=lambda: settings.configured_rule_profile,
         i18n=i18n,  # type: ignore[arg-type]
     )
     now = datetime(2025, 1, 8, 12, 0, tzinfo=timezone.utc)
@@ -411,7 +411,7 @@ def test_playtime_rules_status_reports_each_bank_against_its_maximum(tmp_path: P
 def test_playtime_rules_add_to_bank(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path, banks={"default": BankProfile("default", 60, 200)})
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
 
     _result = rules.add_to_bank(30)
     assert store.get_bank_balance(CHILD_PHONE) == 30
@@ -429,7 +429,7 @@ def test_playtime_rules_activity_addition_targets_first_configured_bank(tmp_path
             "weekly": BankProfile("weekly", 90, 90),
         },
     )
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
 
     rules.add_to_bank(30)
 
@@ -446,7 +446,7 @@ def test_playtime_rules_rollover_updates_every_bank(tmp_path: Path) -> None:
             "weekly": BankProfile("weekly", 90, 90),
         },
     )
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
     store.set_bank_balance(CHILD_PHONE, 170, "earned")
     store.set_bank_balance(CHILD_PHONE, 20, "weekly")
 
@@ -459,7 +459,7 @@ def test_playtime_rules_rollover_updates_every_bank(tmp_path: Path) -> None:
 def test_bank_balance_persists_on_profile_switch_until_rollover(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path)
-    high_profile = settings.default_rule_profile
+    high_profile = settings.configured_rule_profile
     low_profile = RuleProfile(
         name="low",
         banks={"default": BankProfile("default", 30, 90)},
@@ -483,7 +483,7 @@ def test_bank_balance_persists_on_profile_switch_until_rollover(tmp_path: Path) 
 def test_playtime_rules_rollover_week(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
 
     store.set_bank_balance(CHILD_PHONE, 500)
     store.set_bank_balance(CHILD_PHONE, 60, "recovery")
@@ -497,7 +497,7 @@ def test_playtime_rules_rollover_week(tmp_path: Path) -> None:
 def test_playtime_rules_set_bank(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path, banks={"default": BankProfile("default", 60, 200)})
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.default_rule_profile)
+    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
     store.set_bank_balance(CHILD_PHONE, 30)
 
     _result = rules.set_bank(90)

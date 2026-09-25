@@ -9,8 +9,9 @@ The README contains the Docker Compose setup flow, including Signal linking, gro
 - `PHONE_NUMBER` is the linked Signal account used by the bot.
 - `SIGNAL_GROUP_ID` is the one group where the bot listens and posts.
 - `SIGNAL_SERVICE` is the address of `signal-cli-rest-api` from the bot process.
-- `MS_FAMILY_EMAIL` and `MS_FAMILY_PASSWORD` must belong to a Microsoft Family organizer account that can manage the configured children.
-- Microsoft sign-in flows that require MFA or additional proof-up are not supported by the current web client.
+- `MS_FAMILY_EMAIL` must belong to a Microsoft Family organizer account that can manage the configured children.
+- Microsoft sign-in uses passwordless Authenticator number matching. The first operation posts the verification ID to Signal; approve that prompt to bootstrap the session.
+- The authenticated cookie jar is stored at `DATA_DIR/ms-family-session.json` with owner-only permissions and reused across requests and restarts. A new Authenticator prompt appears only when Microsoft expires the session.
 
 ### Admins
 
@@ -72,7 +73,7 @@ Each item in the profile's `blackouts` array has `days`, `start`, and `end`. `da
 
 - `<duration>` - Request playtime, for example `30m`, `30min`, `1.5h`, `1h 30m`, or `3x1h15m`.
 - `<duration> <description>` - Submit an activity claim for admin approval, for example `30m went for a walk`.
-- `status` - Show status for all children.
+- `status` - Validate the Microsoft Family Safety session, then show status for all children. The authentication check does not grant, block, or change balances.
 - `end` - End the child's active session early.
 - `?` - Show child help.
 
@@ -135,6 +136,7 @@ The command accepts whitespace and newlines inside the JSON, so this structure c
 - Ending early returns unused time to every bank debited for that session.
 - Bank balances are stored by child and bank name independently of profiles. Switching profiles preserves them even when a balance exceeds the new maximum; a later rollover may clamp the balance to the active profile's maximum.
 - Activity claims remain pending until an admin runs `ack` or an explicit bank modification.
+- Playtime-request responses and activity-claim submission responses include the child's current pending-claims overview when claims are waiting.
 - Recovery banks refill only when their full required break has completed.
 - If a child interrupts recovery, stopping within the two-minute grace window preserves the previous break progress.
 

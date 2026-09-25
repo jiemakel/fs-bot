@@ -1,0 +1,6 @@
+{
+  "include": ["family_safety_bot", "tests", "main.py"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "typeCheckingMode": "standard"
+}

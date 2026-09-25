@@ -22,6 +22,12 @@ class FixtureSettings(Settings):
 
     default_rule_profile: RuleProfile | None = None
 
+    @property
+    def configured_rule_profile(self) -> RuleProfile:
+        if self.default_rule_profile is None:
+            raise RuntimeError("This test requires a rule profile")
+        return self.default_rule_profile
+
 
 def build_store(tmp_path: Path) -> PlaytimeStore:
     return PlaytimeStore(str(tmp_path / "test_playtime.db"))
@@ -38,7 +44,6 @@ def build_settings(tmp_path: Path, **overrides: Any) -> FixtureSettings:
     )
     values = {
         "ms_family_email": "test@example.com",
-        "ms_family_password": "password",
         "children": {CHILD_PHONE: CHILD},
         "signal_admins": [ADMIN_PHONE],
         "signal_group_id": "test_group",

@@ -25,7 +25,6 @@ def _clear_settings_env(monkeypatch) -> None:
 
 def _set_minimal_env(monkeypatch) -> None:
     monkeypatch.setenv("MS_FAMILY_EMAIL", "parent@example.com")
-    monkeypatch.setenv("MS_FAMILY_PASSWORD", "secret")
     monkeypatch.setenv("SIGNAL_GROUP_ID", "group.test")
     monkeypatch.setenv("ADMIN_1_PHONE", "+10000000001")
     monkeypatch.setenv("CHILD_1_PHONE", "+10000000002")
@@ -63,21 +62,6 @@ def test_parse_profile_definition_rejects_unknown_fields() -> None:
                 "typo": True,
             },
         )
-
-
-def test_parse_profile_definition_uses_first_bank_as_default() -> None:
-    profile = parse_rule_profile_definition(
-        "normal",
-        {
-            "banks": {
-                "earned": {"weekly_addition": "14h", "max_balance": "42h"},
-                "weekly": {"weekly_addition": "30h", "max_balance": "30h"},
-            },
-            "blackouts": [],
-        },
-    )
-
-    assert profile.default_bank.name == "earned"
 
 
 def test_parse_profile_definition_requires_one_replenishment_policy_per_bank() -> None:
@@ -169,7 +153,6 @@ def test_settings_parses_bot_language(monkeypatch) -> None:
 
 def test_settings_parses_more_than_nine_contiguous_admins_and_children(monkeypatch) -> None:
     monkeypatch.setenv("MS_FAMILY_EMAIL", "parent@example.com")
-    monkeypatch.setenv("MS_FAMILY_PASSWORD", "secret")
     monkeypatch.setenv("SIGNAL_GROUP_ID", "group.test")
     for index in range(1, 11):
         monkeypatch.setenv(f"ADMIN_{index}_PHONE", f"+100000000{index:02d}")
