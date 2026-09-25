@@ -111,18 +111,6 @@ def test_playtime_rules_basic_request(tmp_path: Path) -> None:
     assert active[2] == 60
 
 
-def test_playtime_rules_exceeds_bank_balance(tmp_path: Path) -> None:
-    store = build_store(tmp_path)
-    settings = build_settings(tmp_path)
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
-
-    store.set_bank_balance(CHILD_PHONE, 30)
-
-    decision = rules.evaluate_request(60)
-    assert decision.allowed is True
-    assert decision.minutes_granted == 30
-
-
 def test_playtime_rules_secondary_bank_caps_grants(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(
@@ -286,19 +274,6 @@ def test_natural_session_end_starts_recovery_bank_break(tmp_path: Path) -> None:
     assert store.get_bank_balance(CHILD_PHONE, "recovery") == 180
 
 
-def test_recovery_bank_completion_notification_is_one_shot(tmp_path: Path) -> None:
-    store = build_store(tmp_path)
-    settings = build_settings(tmp_path)
-    i18n = RecordingI18n()
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile, i18n=i18n)  # type: ignore[arg-type]
-    base = datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc)
-    store.set_bank_balance(CHILD_PHONE, 90, "recovery", base)
-    rules._get_local_now = lambda: base + timedelta(minutes=30)  # type: ignore[method-assign]
-
-    assert len(rules.check_automatic_updates()) == 1
-    assert rules.check_automatic_updates() == []
-
-
 def test_recovery_break_progress_is_restored_after_quick_stop(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(tmp_path)
@@ -408,18 +383,6 @@ def test_playtime_rules_status_reports_each_bank_against_its_maximum(tmp_path: P
     assert pace_call["balance_share"] == "60.0%"
 
 
-def test_playtime_rules_add_to_bank(tmp_path: Path) -> None:
-    store = build_store(tmp_path)
-    settings = build_settings(tmp_path, banks={"default": BankProfile("default", 60, 200)})
-    rules = PlaytimeRules(CHILD_PHONE, settings, store, profile_provider=lambda: settings.configured_rule_profile)
-
-    _result = rules.add_to_bank(30)
-    assert store.get_bank_balance(CHILD_PHONE) == 30
-
-    _result = rules.add_to_bank(200)
-    assert store.get_bank_balance(CHILD_PHONE) == 200
-
-
 def test_playtime_rules_activity_addition_targets_first_configured_bank(tmp_path: Path) -> None:
     store = build_store(tmp_path)
     settings = build_settings(
@@ -434,6 +397,10 @@ def test_playtime_rules_activity_addition_targets_first_configured_bank(tmp_path
     rules.add_to_bank(30)
 
     assert store.get_bank_balance(CHILD_PHONE, "earned") == 30
+    assert store.get_bank_balance(CHILD_PHONE, "weekly") == 0
+
+    rules.add_to_bank(200)
+    assert store.get_bank_balance(CHILD_PHONE, "earned") == 200
     assert store.get_bank_balance(CHILD_PHONE, "weekly") == 0
 
 

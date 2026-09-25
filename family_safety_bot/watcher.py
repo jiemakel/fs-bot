@@ -160,25 +160,23 @@ class PlaytimeManager(DataMessageHandler):
         self,
         ctx: DataMessageContext,
         payload: str,
-        parse_minutes: Callable[[str], int | None],
-    ) -> tuple[list[tuple[Child, PlaytimeRules]], int, bool] | None:
+    ) -> tuple[list[tuple[Child, PlaytimeRules]], int] | None:
         if not (stripped := payload.strip()):
             return None
 
         parts = stripped.split(maxsplit=1)
         if len(parts) == 2:
             child_name, duration_text = parts
-            if child_name == "*":
-                if (minutes := parse_minutes(duration_text)) is not None:
-                    return (self._all_children(), minutes, not duration_text.lstrip().startswith("="))
-            elif (minutes := parse_minutes(duration_text)) is not None:
+            if (minutes := parse_duration_minutes(duration_text)) is not None:
+                if child_name == "*":
+                    return self._all_children(), minutes
                 if resolved := await self._resolve_child(ctx, child_name):
-                    return ([(resolved[0], resolved[1])], minutes, not duration_text.lstrip().startswith("="))
+                    return [resolved], minutes
 
-        if (minutes := parse_minutes(stripped)) is None:
+        if (minutes := parse_duration_minutes(stripped)) is None:
             return None
 
-        return (self._all_children(), minutes, not stripped.lstrip().startswith("="))
+        return self._all_children(), minutes
 
     async def _parse_children_payload(
         self,
@@ -189,10 +187,7 @@ class PlaytimeManager(DataMessageHandler):
         if not child_name or child_name == "*":
             return self._all_children()
         resolved = await self._resolve_child(ctx, child_name)
-        if not resolved:
-            return None
-        child, child_rules = resolved
-        return [(child, child_rules)]
+        return [resolved] if resolved else None
 
     def _profile_summary(self, profile: RuleProfile) -> str:
         day_to_ranges: dict[int, list[str]] = {idx: [] for idx in range(7)}
@@ -347,21 +342,6 @@ class PlaytimeManager(DataMessageHandler):
             await action(child, rules)
         return True
 
-    async def _run_for_resolved_children_and_minutes(
-        self,
-        ctx: DataMessageContext,
-        payload: str,
-        parse_minutes: Callable[[str], int | None],
-        action: Callable[[Child, PlaytimeRules, int, bool], Awaitable[None]],
-    ) -> bool:
-        resolved = await self._parse_children_and_minutes(ctx, payload, parse_minutes)
-        if not resolved:
-            return True
-        children, minutes, is_relative = resolved
-        for child, rules in children:
-            await action(child, rules, minutes, is_relative)
-        return True
-
     async def _handle_admin_command(
         self,
         ctx: DataMessageContext,
@@ -428,9 +408,11 @@ class PlaytimeManager(DataMessageHandler):
         await ctx.send(SendMessage(text=self._i18n.msg("watcher.admin_child_unblocked", child_name=child.name)))
 
     async def _handle_admin_test_command(self, ctx: DataMessageContext, payload: str) -> bool:
-        return await self._run_for_resolved_children_and_minutes(
-            ctx, payload, parse_duration_minutes, lambda c, r, m, _: self.request_command(ctx, c, r, m, c.name + " (TEST)")
-        )
+        if resolved := await self._parse_children_and_minutes(ctx, payload):
+            children, minutes = resolved
+            for child, rules in children:
+                await self.request_command(ctx, child, rules, minutes, child.name + " (TEST)")
+        return True
 
     async def _handle_admin_end_command(self, ctx: DataMessageContext, payload: str) -> bool:
         return await self._run_for_resolved_children(ctx, payload, lambda c, r: self.admin_end_session_command(ctx, c, r))
@@ -521,17 +503,16 @@ class PlaytimeManager(DataMessageHandler):
                 return amount, sign != "="
             return None
 
-        first_is_all_children = parts[0] == "*"
-        child_rules_entry = None if first_is_all_children else self._children_by_name.get(parts[0].lower())
-        first_is_child = first_is_all_children or (child_rules_entry is not None)
-
-        if first_is_child:
-            children: list[tuple[Child, PlaytimeRules]] = (
-                self._all_children() if first_is_all_children else [(child_rules_entry[0], child_rules_entry[1])]  # type: ignore[index]
-            )
+        child_rules_entry = self._children_by_name.get(parts[0].lower())
+        if parts[0] == "*":
+            children = self._all_children()
+        elif child_rules_entry is not None:
+            children = [child_rules_entry]
+        else:
+            children = None
+        if children is not None:
             if len(parts) >= 3 and (parsed := parsed_duration(" ".join(parts[2:]))):
-                bank_name: str | None = "*" if parts[1] == "*" else parts[1]
-                return (children, bank_name, parsed[0], parsed[1])
+                return (children, parts[1], parsed[0], parsed[1])
             if len(parts) >= 2 and (parsed := parsed_duration(" ".join(parts[1:]))):
                 return (children, None, parsed[0], parsed[1])
             return None

@@ -74,17 +74,12 @@ class PlaytimeRules:
         return self._profile_provider()
 
     @staticmethod
-    def _parse_blackout_periods(
-        blackout_periods: tuple[tuple[int, str, str], ...],
-    ) -> tuple[tuple[int, int, int, str, str], ...]:
+    def _parsed_blackout_periods(profile: RuleProfile) -> tuple[tuple[int, int, int, str, str], ...]:
         return tuple(
             parsed
-            for weekday, start_time, end_time in blackout_periods
+            for weekday, start_time, end_time in profile.blackout_periods
             if (parsed := _parse_blackout_period(weekday, start_time, end_time)) is not None
         )
-
-    def _parsed_blackout_periods(self, profile: RuleProfile) -> tuple[tuple[int, int, int, str, str], ...]:
-        return self._parse_blackout_periods(tuple(profile.blackout_periods))
 
     def _get_local_now(self) -> datetime:
         return datetime.now(self._tz)
@@ -97,9 +92,6 @@ class PlaytimeRules:
     def _recovery_minutes(bank: BankProfile, balance: int) -> int:
         assert bank.recovery_rate is not None
         return max(0, math.ceil((bank.max_balance_minutes - balance) / bank.recovery_rate - 1e-9))
-
-    def _initial_balance(self, bank: BankProfile) -> int:
-        return bank.max_balance_minutes if bank.is_recovery else 0
 
     @staticmethod
     def _matching_day_banks(profile: RuleProfile, weekday: int) -> dict[str, BankProfile]:
@@ -152,7 +144,7 @@ class PlaytimeRules:
             balance, updated_at = self._store.get_bank_state(
                 self._child_id,
                 bank.name,
-                self._initial_balance(bank),
+                bank.max_balance_minutes if bank.is_recovery else 0,
                 now,
             )
             if bank.is_recovery and active is None and balance < bank.max_balance_minutes:
@@ -281,6 +273,15 @@ class PlaytimeRules:
         tomorrow = (dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         return max(0, int((tomorrow - dt).total_seconds() // 60))
 
+    def _schedule_capacities(self, now: datetime, profile: RuleProfile) -> tuple[int | None, int | None]:
+        blackout_capacity = self._minutes_until_next_blackout(now, profile)
+        day_capacity = (
+            self._minutes_until_next_day(now)
+            if any(bank.is_day_bank for bank in profile.banks.values())
+            else None
+        )
+        return blackout_capacity, day_capacity
+
     @staticmethod
     def _merged_minutes(ranges: list[tuple[int, int]]) -> int:
         if not ranges:
@@ -343,9 +344,10 @@ class PlaytimeRules:
         self,
         state: RuntimeState,
         profile: RuleProfile,
-        minutes_until_blackout: int | None,
+        schedule_capacities: tuple[int | None, int | None],
         requested_minutes: int | None = None,
     ) -> int:
+        schedule_capacity = min((c for c in schedule_capacities if c is not None), default=None)
         balances = self._limiting_balances(state, profile)
         if balances:
             target = state.active_remaining + max(0, min(balances.values()))
@@ -353,9 +355,9 @@ class PlaytimeRules:
             target = requested_minutes
         else:
             # Day banks decide whether today may be used, not how many minutes it contains.
-            target = minutes_until_blackout if minutes_until_blackout is not None else 1440
-        if minutes_until_blackout is not None:
-            target = min(target, minutes_until_blackout)
+            target = schedule_capacity if schedule_capacity is not None else 1440
+        if schedule_capacity is not None:
+            target = min(target, schedule_capacity)
         return max(0, target)
 
     def _partial_grant_reason(
@@ -431,20 +433,10 @@ class PlaytimeRules:
                 ),
             )
 
-        blackout_capacity = self._minutes_until_next_blackout(now, profile)
-        day_capacity = (
-            self._minutes_until_next_day(now)
-            if any(bank.is_day_bank for bank in profile.banks.values())
-            else None
-        )
-        schedule_capacity = min(
-            capacity
-            for capacity in (blackout_capacity, day_capacity)
-            if capacity is not None
-        ) if blackout_capacity is not None or day_capacity is not None else None
+        schedule_capacities = self._schedule_capacities(now, profile)
         granted = min(
             max(0, requested_minutes),
-            self._max_target_minutes_from_now(state, profile, schedule_capacity, requested_minutes),
+            self._max_target_minutes_from_now(state, profile, schedule_capacities, requested_minutes),
         )
         if granted <= state.active_remaining:
             return PlaytimeDecision(
@@ -464,8 +456,7 @@ class PlaytimeRules:
                 granted,
                 state,
                 profile,
-                blackout_capacity,
-                day_capacity,
+                *schedule_capacities,
             ),
             granted,
         )
@@ -488,14 +479,11 @@ class PlaytimeRules:
             else:
                 self._store.clear_recovery_interruption(self._child_id)
 
-        new_balances = {
-            key: balance if bank.is_day_bank else balance - additional
-            for key, bank in profile.banks.items()
-            for balance in (state.bank_balances[key],)
-        }
-        for key, balance in new_balances.items():
-            if not profile.banks[key].is_day_bank:
-                self._store.set_bank_balance(self._child_id, balance, profile.banks[key].name, now)
+        new_balances = state.bank_balances.copy()
+        for key, bank in profile.banks.items():
+            if not bank.is_day_bank:
+                new_balances[key] -= additional
+                self._store.set_bank_balance(self._child_id, new_balances[key], bank.name, now)
 
         if state.active_session is None:
             session_id = self._store.add_session(self._child_id, now, minutes)
@@ -588,18 +576,7 @@ class PlaytimeRules:
             "",
         ]
 
-        blackout_capacity = self._minutes_until_next_blackout(now, profile)
-        day_capacity = (
-            self._minutes_until_next_day(now)
-            if any(bank.is_day_bank for bank in profile.banks.values())
-            else None
-        )
-        schedule_capacity = min(
-            capacity
-            for capacity in (blackout_capacity, day_capacity)
-            if capacity is not None
-        ) if blackout_capacity is not None or day_capacity is not None else None
-        available = self._max_target_minutes_from_now(state, profile, schedule_capacity)
+        available = self._max_target_minutes_from_now(state, profile, self._schedule_capacities(now, profile))
         if any(
             state.bank_balances[key] <= 0
             for key in self._untapped_day_banks(now, profile)

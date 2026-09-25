@@ -37,8 +37,8 @@ class PlaytimeStore:
         with sqlite3.connect(self._db_path) as conn:
             self._ensure_schema(conn)
 
-    @classmethod
-    def _ensure_schema(cls, conn: sqlite3.Connection) -> None:
+    @staticmethod
+    def _ensure_schema(conn: sqlite3.Connection) -> None:
         """Create tables for playtime tracking (multi-child)."""
         conn.executescript(
             """
@@ -90,24 +90,10 @@ class PlaytimeStore:
             );
             """
         )
-        conn.commit()
 
-    def _execute(
-        self,
-        sql: str,
-        params: tuple = (),
-        commit: bool = False,
-    ) -> sqlite3.Cursor:
+    def _execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with sqlite3.connect(self._db_path) as conn:
-            cursor = conn.execute(sql, params)
-            if commit:
-                conn.commit()
-            return cursor
-
-    @staticmethod
-    def _serialize_blackout_periods(blackout_periods: list[tuple[int, str, str]]) -> str:
-        serializable = [[weekday, start_time, end_time] for weekday, start_time, end_time in blackout_periods]
-        return json.dumps(serializable, separators=(",", ":"))
+            return conn.execute(sql, params)
 
     @staticmethod
     def _deserialize_blackout_periods(raw: str) -> list[tuple[int, str, str]]:
@@ -168,7 +154,6 @@ class PlaytimeStore:
             ON CONFLICT(key) DO UPDATE SET value = excluded.value;
             """,
             (key, value),
-            commit=True,
         )
 
     def _get_app_state(self, key: str) -> str | None:
@@ -191,7 +176,6 @@ class PlaytimeStore:
             """INSERT OR IGNORE INTO bank (child_id, bank_name, balance_minutes, last_update_iso)
                VALUES (?, ?, ?, ?);""",
             (child_id, bank_name.lower(), initial_balance, update_time.isoformat()),
-            commit=True,
         )
         row = self._execute(
             "SELECT balance_minutes, last_update_iso FROM bank WHERE child_id = ? AND bank_name = ?;",
@@ -212,11 +196,13 @@ class PlaytimeStore:
     ) -> None:
         """Set one named bank balance for a child."""
         changed_at = update_time or datetime.now(timezone.utc)
-        self.get_bank_state(child_id, bank_name, now=changed_at)
         self._execute(
-            "UPDATE bank SET balance_minutes = ?, last_update_iso = ? WHERE child_id = ? AND bank_name = ?;",
-            (balance_minutes, changed_at.isoformat(), child_id, bank_name.lower()),
-            commit=True,
+            """INSERT INTO bank (child_id, bank_name, balance_minutes, last_update_iso)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(child_id, bank_name) DO UPDATE SET
+                   balance_minutes = excluded.balance_minutes,
+                   last_update_iso = excluded.last_update_iso;""",
+            (child_id, bank_name.lower(), balance_minutes, changed_at.isoformat()),
         )
 
     def add_to_bank(self, child_id: str, minutes: int, max_balance: int, bank_name: str = "default") -> int:
@@ -235,7 +221,6 @@ class PlaytimeStore:
             VALUES (?, ?, ?);
             """,
             (child_id, start_time.isoformat(), minutes_granted),
-            commit=True,
         )
         return cursor.lastrowid  # type: ignore
 
@@ -248,7 +233,6 @@ class PlaytimeStore:
             WHERE session_id = ?;
             """,
             (end_time.isoformat(), session_id),
-            commit=True,
         )
 
     def set_session_minutes_granted(self, session_id: int, minutes_granted: int) -> None:
@@ -260,7 +244,6 @@ class PlaytimeStore:
             WHERE session_id = ?;
             """,
             (minutes_granted, session_id),
-            commit=True,
         )
 
     def add_session_bank_debit(self, session_id: int, bank_name: str, minutes: int) -> None:
@@ -272,7 +255,6 @@ class PlaytimeStore:
                 minutes_debited = minutes_debited + excluded.minutes_debited;
             """,
             (session_id, bank_name.lower(), minutes),
-            commit=True,
         )
 
     def get_session_bank_debits(self, session_id: int) -> dict[str, int]:
@@ -312,7 +294,6 @@ class PlaytimeStore:
                    VALUES (?, ?, ?, ?);""",
                 (child_id, bank_name.lower(), local_date, session_id),
             )
-            conn.commit()
         return True
 
     def get_active_session(self, child_id: str) -> ActiveSession | None:
@@ -349,9 +330,8 @@ class PlaytimeStore:
             (
                 profile.name,
                 self._serialize_banks(profile.banks),
-                self._serialize_blackout_periods(profile.blackout_periods),
+                json.dumps(profile.blackout_periods, separators=(",", ":")),
             ),
-            commit=True,
         )
 
     def list_rule_profiles(self) -> list[RuleProfile]:
@@ -425,7 +405,6 @@ class PlaytimeStore:
             VALUES (?, ?, ?, ?);
             """,
             (child_id, claimed_minutes, description, submitted_at.isoformat()),
-            commit=True,
         )
         return cursor.lastrowid  # type: ignore
 
@@ -466,6 +445,5 @@ class PlaytimeStore:
             WHERE child_id = ? AND handled = 0;
             """,
             (granted_minutes, child_id),
-            commit=True,
         )
         return cursor.rowcount

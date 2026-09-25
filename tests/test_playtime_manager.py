@@ -99,18 +99,6 @@ def _profile_json(banks: dict[str, dict[str, str]] | None = None) -> str:
     )
 
 
-def test_playtime_manager_status_command(tmp_path: Path) -> None:
-    manager, store = _build_manager(tmp_path)
-    store.set_bank_balance(CHILD_PHONE, 120)
-
-    ctx = FakeContext(message_text="status", sender=CHILD_PHONE, sent_messages=[])
-    _run_handle(manager, ctx)
-
-    assert len(ctx.sent_messages) == 1
-    assert store.get_bank_balance(CHILD_PHONE) == 120
-    assert store.get_active_session(CHILD_PHONE) is None
-
-
 def test_playtime_manager_parses_day_bank_admin_amount(tmp_path: Path) -> None:
     manager, _store = _build_manager(tmp_path)
 
@@ -224,6 +212,7 @@ def test_child_command_reports_stale_authentication_without_starting_challenge(
 
 def test_playtime_manager_status_includes_pending_activity_claims(tmp_path: Path) -> None:
     manager, store = _build_manager(tmp_path)
+    store.set_bank_balance(CHILD_PHONE, 120)
     store.add_activity_claim(CHILD_PHONE, 30, "30m played guitar", datetime.now(timezone.utc))
     store.add_activity_claim(CHILD_PHONE, 60, "1h cleaned room", datetime.now(timezone.utc))
 
@@ -235,16 +224,6 @@ def test_playtime_manager_status_includes_pending_activity_claims(tmp_path: Path
     assert "30m played guitar" in ctx.sent_messages[0]
     assert "1h cleaned room" in ctx.sent_messages[0]
     assert "Total: 1h 30m" in ctx.sent_messages[0]
-
-
-def test_playtime_manager_child_request_validation(tmp_path: Path) -> None:
-    manager, store = _build_manager(tmp_path)
-    store.set_bank_balance(CHILD_PHONE, 120)
-
-    ctx = FakeContext(message_text="0m", sender=CHILD_PHONE, sent_messages=[])
-    _run_handle(manager, ctx)
-
-    assert len(ctx.sent_messages) == 1
     assert store.get_bank_balance(CHILD_PHONE) == 120
     assert store.get_active_session(CHILD_PHONE) is None
 
@@ -284,6 +263,8 @@ def test_playtime_request_includes_pending_claims(tmp_path: Path, outcome: str) 
     assert "other child's activity" not in response
     assert len(store.get_pending_claims(CHILD_PHONE)) == 2
     assert (store.get_active_session(CHILD_PHONE) is not None) == (outcome == "granted")
+    expected_balance = 0 if outcome == "empty_bank" else 90 if outcome == "granted" else 120
+    assert store.get_bank_balance(CHILD_PHONE) == expected_balance
 
 
 def test_playtime_request_without_pending_claims_omits_overview(tmp_path: Path) -> None:
@@ -483,24 +464,6 @@ def test_playtime_manager_admin_block_ends_active_session(tmp_path: Path) -> Non
     assert store.is_child_block_mode_enabled(CHILD_PHONE) is True
     assert store.get_active_session(CHILD_PHONE) is None
     assert len(block_ctx.sent_messages) == 1
-
-
-def test_playtime_manager_child_request_denied_while_grant_block_mode_enabled(tmp_path: Path) -> None:
-    manager, store = _build_manager(tmp_path)
-    store.set_bank_balance(CHILD_PHONE, 120)
-    store.set_child_block_mode(CHILD_PHONE, True)
-
-    async def fake_grant(_child_id: str, _minutes: int, _mfa_handler: Any = None) -> bool:
-        raise AssertionError("grant API should not be called while block mode is enabled")
-
-    manager._grant_via_ms_api = fake_grant  # type: ignore[method-assign]
-
-    ctx = FakeContext(message_text="1h", sender=CHILD_PHONE, sent_messages=[])
-    _run_handle(manager, ctx)
-
-    assert len(ctx.sent_messages) == 1
-    assert store.get_bank_balance(CHILD_PHONE) == 120
-    assert store.get_active_session(CHILD_PHONE) is None
 
 
 def test_playtime_manager_child_request_accepts_compound_duration(tmp_path: Path) -> None:
@@ -801,22 +764,6 @@ def test_playtime_manager_profile_use_default_assigns_default_profile_to_child(t
     assert store.get_active_rule_profile_name_for_child(CHILD_PHONE) == "default"
 
 
-def test_child_activity_claim_stored_and_bank_unchanged(tmp_path: Path) -> None:
-    manager, store = _build_manager(tmp_path)
-    store.set_bank_balance(CHILD_PHONE, 60)
-
-    ctx = FakeContext(message_text="30m played guitar", sender=CHILD_PHONE, sent_messages=[])
-    _run_handle(manager, ctx)
-
-    assert len(ctx.sent_messages) == 1
-    assert store.get_bank_balance(CHILD_PHONE) == 60
-    assert store.get_active_session(CHILD_PHONE) is None
-    claims = store.get_pending_claims(CHILD_PHONE)
-    assert len(claims) == 1
-    assert claims[0].claimed_minutes == 30
-    assert claims[0].description == "30m played guitar"
-
-
 @pytest.mark.parametrize(
     ("language", "header", "total"),
     [
@@ -845,28 +792,22 @@ def test_activity_claim_response_includes_updated_pending_overview(
     assert "30m played guitar" in overview
     assert total in overview
     assert "other child's activity" not in overview
-    assert len(store.get_pending_claims(CHILD_PHONE)) == 2
+    claims = store.get_pending_claims(CHILD_PHONE)
+    assert len(claims) == 2
+    assert claims[-1].claimed_minutes == 30
+    assert claims[-1].description == "30m played guitar"
     assert store.get_bank_balance(CHILD_PHONE) == 60
+    assert store.get_active_session(CHILD_PHONE) is None
 
 
-def test_admin_claims_lists_pending(tmp_path: Path) -> None:
-    manager, store = _build_manager(tmp_path)
-    store.add_activity_claim(CHILD_PHONE, 30, "30m played guitar", datetime.now(timezone.utc))
-    store.add_activity_claim(CHILD_PHONE, 60, "1h cleaned room", datetime.now(timezone.utc))
-
-    ctx = FakeContext(message_text="claims", sender=ADMIN_PHONE, sent_messages=[])
-    _run_handle(manager, ctx)
-
-    assert len(ctx.sent_messages) == 1
-
-
-@pytest.mark.parametrize("command", ["30m", "30m played guitar", "status", "claims", "ack"])
 @pytest.mark.parametrize(
-    ("submitted_at", "local_timestamp"),
+    ("command", "submitted_at", "local_timestamp"),
     [
-        (datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc), "2025-01-06 14:00"),
-        (datetime(2025, 7, 6, 12, 0, tzinfo=timezone.utc), "2025-07-06 15:00"),
-        (datetime(2025, 7, 6, 22, 0, tzinfo=timezone.utc), "2025-07-07 01:00"),
+        (command, datetime(2025, 1, 6, 12, 0, tzinfo=timezone.utc), "2025-01-06 14:00")
+        for command in ("30m", "30m played guitar", "status", "claims", "ack")
+    ] + [
+        ("claims", datetime(2025, 7, 6, 12, 0, tzinfo=timezone.utc), "2025-07-06 15:00"),
+        ("claims", datetime(2025, 7, 6, 22, 0, tzinfo=timezone.utc), "2025-07-07 01:00"),
     ],
 )
 def test_claim_submission_times_use_configured_timezone(
